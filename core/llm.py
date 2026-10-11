@@ -12,6 +12,14 @@ import re
 
 from . import config
 
+# .env support: standard env file at project root is loaded once at import —
+# real environment variables always win over .env values.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(config.ROOT / ".env")
+except ImportError:
+    pass
+
 KEY_ENV_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 
 

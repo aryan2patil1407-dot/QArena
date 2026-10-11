@@ -12,3 +12,4 @@ pydantic>=2               # Stage-4/5 contracts (TestCase, PossibleBug, RunResul
 pytest>=8                 # exported suite runner (self-verified green)
 # LLM is optional: QArena runs fully key-free (heuristic mode). Set an API key
 # and the 4-call hybrid planner/judge/reporter upgrade kicks in automatically.
+python-dotenv>=1
