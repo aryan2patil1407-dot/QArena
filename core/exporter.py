@@ -117,9 +117,9 @@ def browser_type_launch_args(browser_type_launch_args):
 
         keep: list[str] = []
         for name in files:
-            ok = name in passed_files
-            if ok:
+            if name in passed_files:
                 keep.append(name)
+                continue          # delivered files must stay runnable .py files
             # dropped files stay on disk with a .dropped suffix for inspection
             try:
                 (self.out_dir / name).rename(self.out_dir / (name + ".dropped"))
@@ -142,7 +142,7 @@ def browser_type_launch_args(browser_type_launch_args):
         by_file: dict[str, list[bool]] = {}
         for suite in suites:
             for case in suite.iter("testcase"):
-                fname = Path(case.get("file") or "").name
+                fname = self._file_of_case(case)
                 if not fname:
                     continue
                 bad = any(case.find(t) is not None for t in ("failure", "error"))
@@ -150,3 +150,20 @@ def browser_type_launch_args(browser_type_launch_args):
                 by_file.setdefault(fname, []).append(not bad and not skipped)
         return ({f for f, results in by_file.items() if results and all(results)},
                 f"JUnit report parsed: {len(by_file)} file(s) executed")
+
+    @staticmethod
+    def _file_of_case(case) -> str:
+        """The exported filename a JUnit <testcase> belongs to.
+
+        pytest only writes the `file` attribute in some configurations; every
+        report does carry `classname` (dotted module path) and `name` (function
+        + parametrisation suffix). Relying on `file` alone made a fully green
+        suite read as "0 file(s) executed" and dropped every delivered test.
+        """
+        raw = (case.get("file") or "").strip()
+        if raw:
+            return Path(raw).name
+        stem = ((case.get("classname") or "").split(".")[-1]
+                or (case.get("name") or ""))
+        stem = re.sub(r"\[.*?\]$", "", stem)
+        return f"{stem}.py" if stem else ""

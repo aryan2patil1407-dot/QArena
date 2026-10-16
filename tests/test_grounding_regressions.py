@@ -266,6 +266,45 @@ def test_exported_suite_ships_the_external_browser_override(tmp_path):
     assert "browser_type_launch_args" in conftest
 
 
+# pytest's own JUnit output: classname + parametrised name, NO file attribute
+_JUNIT_NO_FILE_ATTR = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0"
+ skipped="0" tests="2" time="0.8"><testcase classname="artifacts.run_x.exported_tests.test_tc_010_route_ok"
+ name="test_tc_010_route_ok[chromium]" time="0.5" /><testcase classname="artifacts.run_x.exported_tests.test_tc_011_route_bad"
+ name="test_tc_011_route_bad[chromium]" time="0.3"><failure message="boom">traceback</failure></testcase>
+</testsuite></testsuites>"""
+
+
+def test_junit_without_a_file_attribute_is_matched_by_classname(tmp_path):
+    ex = Exporter(tmp_path, TARGET)
+    report = tmp_path / "junit.xml"
+    report.write_text(_JUNIT_NO_FILE_ATTR, encoding="utf-8")
+    passed, note = ex._read_junit(report)
+    # pre-fix: empty set ("0 file(s) executed") -> every green test dropped
+    assert passed == {"test_tc_010_route_ok.py"}
+    assert "2 file" in note
+
+
+def test_verified_files_are_kept_runnable_and_failures_are_dropped(tmp_path, monkeypatch):
+    ex = Exporter(tmp_path, TARGET)
+    names = ["test_tc_010_route_ok.py", "test_tc_011_route_bad.py"]
+    for n in names:
+        (ex.out_dir / n).write_text("# exported\n", encoding="utf-8")
+    monkeypatch.setattr("core.exporter.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(
+                            returncode=1, stdout="", stderr=""))
+
+    def fake_read(report):
+        return {"test_tc_010_route_ok.py"}, "JUnit report parsed: 2 file(s) executed"
+
+    monkeypatch.setattr(ex, "_read_junit", fake_read)
+    keep, _note = ex.self_verify(names)
+    assert keep == ["test_tc_010_route_ok.py"]
+    assert (ex.out_dir / "test_tc_010_route_ok.py").exists()          # pre-fix: renamed
+    assert not (ex.out_dir / "test_tc_010_route_ok.py.dropped").exists()
+    assert (ex.out_dir / "test_tc_011_route_bad.py.dropped").exists()
+
+
 # ------------------------------------------------------------------ 7) landing
 def test_landing_page_links_only_to_real_runs(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
