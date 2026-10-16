@@ -318,9 +318,17 @@ def test_landing_page_links_only_to_real_runs(tmp_path, monkeypatch):
     assert "cli1791734448" not in html        # pre-fix: hard-coded dead run id
     assert 'href="/runs/' not in html         # no completed run -> no link at all
 
-    run = tmp_path / "run_cliTEST1234"
-    run.mkdir()
-    (run / "results.json").write_text('{"run_id": "cliTEST1234"}', encoding="utf-8")
+    # a run that errored (e.g. a test fixture stub) is not a "real report"
+    stub = tmp_path / "run_deadbeef01"
+    stub.mkdir()
+    (stub / "results.json").write_text(
+        '{"run_id": "deadbeef01", "status": "error"}', encoding="utf-8")
+    assert 'href="/runs/' not in client.get("/").text
+
+    done = tmp_path / "run_cliTEST1234"
+    done.mkdir()
+    (done / "results.json").write_text(
+        '{"run_id": "cliTEST1234", "status": "done"}', encoding="utf-8")
     assert "/runs/cliTEST1234" in client.get("/").text
 
 

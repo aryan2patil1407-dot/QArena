@@ -82,17 +82,25 @@ def load_handle(run_id: str):
 
 # ---------------------------------------------------------------- pages
 def newest_run_id() -> str:
-    """Run id of the newest completed hunt in this workspace ("" if none).
+    """Run id of the newest COMPLETED hunt in this workspace ("" if none).
 
     The landing page links to a *real* report — hard-coding a run id produced
-    dead links as soon as that artifact directory was gone.
+    dead links as soon as that artifact directory was gone, and a run that
+    errored (or a test fixture stub) is not a report worth opening.
     """
     try:
-        runs = [p for p in config.ARTIFACTS.glob("run_*")
-                if (p / "results.json").exists()]
-        if not runs:
-            return ""
-        return max(runs, key=lambda p: p.stat().st_mtime).name[len("run_"):]
+        best, best_mtime = "", -1.0
+        for results in config.ARTIFACTS.glob("run_*/results.json"):
+            try:
+                data = json.loads(results.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("status") not in ("done", "partial"):
+                continue
+            mtime = results.stat().st_mtime
+            if mtime > best_mtime:
+                best, best_mtime = results.parent.name[len("run_"):], mtime
+        return best
     except Exception:
         return ""
 
