@@ -21,8 +21,13 @@ class Planner:
         self.map = appmap
         self.llm = llm
         self.element_index = self._index_elements()
+        # real catalog names only: an invented product name here produced
+        # reports about products the target does not have — never fabricate
+        # target data. Journeys needing a product name are skipped instead.
         self.products = [n for n in appmap.catalog_prices.keys()
-                         if len(n) > 2][:8] or ["Quantum Mug"]
+                         if len(n) > 2][:8]
+        # may we assert a cart badge? only when the explorer actually saw one
+        self.has_badge = any(s.has_cart_badge for s in appmap.states)
 
     # ------------------------------------------------------- element index
     def _index_elements(self) -> dict[str, set[str]]:
@@ -42,6 +47,15 @@ class Planner:
                        for s in self.map.states)
         frag = self._norm(name_frag)
         return any(frag in n for n in self.element_index.get(role, set()))
+
+    def named(self, role: str, fragments) -> str:
+        """First mapped element (original casing) whose name matches a fragment."""
+        for s in self.map.states:
+            for e in s.elements:
+                if e.role == role and any(f in self._norm(e.name)
+                                          for f in fragments):
+                    return e.name
+        return ""
 
     def route_of(self, frag: str, default: str) -> str:
         f = self._norm(frag)
@@ -109,7 +123,7 @@ class Planner:
             uid[0] += 1
             return f"TC_{uid[0]:03d}"
 
-        prod = self.products[0]
+        prod = self.products[0] if self.products else ""
 
         # --- auth journeys ---------------------------------------------------
         if self.has("route", "signup"):
@@ -132,16 +146,23 @@ class Planner:
                 expected=ExpectedContract(should_reject=True, error_text="valid email",
                                           disallowed_url="/")))
         if self.has("route", "login"):
+            # grounded oracle: demand the app's OWN logout control when the map
+            # shows one; otherwise demand only that login LEFT the login page.
+            # The hard-coded "Log out" expectation filed false bugs on apps that
+            # never had such a control.
+            logout = (self.named("button", ("log out", "logout", "sign out"))
+                      or self.named("link", ("log out", "logout", "sign out")))
             T.append(TestCase(
                 test_id=nid(), journey_type="happy_path", title="Log in with valid credentials",
                 steps=[StepSpec(step=1, action="goto", target="/login"),
                        StepSpec(step=2, action="fill", role="textbox", name="Email", value="demo@cloudcart.dev"),
                        StepSpec(step=3, action="fill", role="textbox", name="Password", value="demo12345"),
                        StepSpec(step=4, action="click", role="button", name="Log in")],
-                expected=ExpectedContract(text_required=["Log out"])))
+                expected=(ExpectedContract(text_required=[logout]) if logout
+                          else ExpectedContract(disallowed_url="/login"))))
 
         # --- search intent ---------------------------------------------------
-        if self.has("searchbox", ""):
+        if self.has("searchbox", "") and prod:
             T.append(TestCase(
                 test_id=nid(), journey_type="happy_path",
                 title=f"Search finds exact product name '{prod}'",
@@ -153,10 +174,11 @@ class Planner:
 
         # --- cart / promo / quantity adversarial -----------------------------
         can_cart = self.has("button", "add to cart")
-        if can_cart:
+        if can_cart and self.has_badge:
             T.append(TestCase(
                 test_id=nid(), journey_type="happy_path",
-                title=f"Add '{prod}' to cart — badge shows 1",
+                title=f"Add '{prod}' to cart — badge shows 1" if prod
+                      else "Add to Cart — badge shows 1",
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="click", role="button", name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=1)))
@@ -166,6 +188,7 @@ class Planner:
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="dblclick", role="button", name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=1)))
+        if can_cart:
             T.append(TestCase(
                 test_id=nid(), journey_type="edge_case_negative",
                 title="Cart rejects negative quantity (-5)",
@@ -292,20 +315,47 @@ class Planner:
         routes = {"/"} | {s.route for s in self.map.states}
         for tc in cases:
             ok, bad_steps = True, []
+            route = "/"          # page reached by the most recent goto step
             for st in tc.steps:
                 if st.action == "goto":
                     pat = re.sub(r"/\d+(?=/|$)", "/*", st.target)
                     if st.target not in routes and pat not in routes:
                         ok = False
                         bad_steps.append(f"goto {st.target}")
+                    route = st.target
                 elif st.action in ("click", "fill", "select", "dblclick", "press"):
                     if not self.has(st.role, st.name):
                         ok = False
                         bad_steps.append(f'{st.action} {st.role} "{st.name}"')
+                    elif st.action in ("click", "dblclick") and \
+                            not self._on_route(route, st.role, st.name):
+                        # the control exists somewhere in the app but not on the
+                        # page this step is actually on -> an invented route+
+                        # element pair (clicking "Add to Cart" on a page that
+                        # has no such button)
+                        ok = False
+                        bad_steps.append(f'{st.action} {st.role} "{st.name}" '
+                                         f"is not on {route}")
             (valid if ok else rejected).append(
                 tc if ok else {"test_id": tc.test_id, "title": tc.title,
                                "invented_steps": bad_steps})
         return valid, rejected
+
+    def _on_route(self, route: str, role: str, name: str) -> bool:
+        """Does `role`/`name` exist on the page reached by `route`?
+
+        Only answers when that page is actually mapped (otherwise the caller
+        falls back to the global check) — a route we never mapped must not make
+        a step look invented.
+        """
+        pat = re.sub(r"/\d+(?=/|$)", "/*", route or "")
+        state = next((s for s in self.map.states
+                      if s.route == pat or s.route == route), None)
+        if state is None or not state.elements:
+            return True
+        frag = self._norm(name)
+        return any(e.role == role and frag in self._norm(e.name)
+                   for e in state.elements)
 
     # -------------------------------------------------------------- priority
     @staticmethod

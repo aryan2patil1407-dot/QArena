@@ -18,7 +18,11 @@
     fresh, clean browsers</strong>. Everything else gets dropped.</p>
     <p class="cta-row">
       <a class="btn-ink big" href="/expedition">Send it hunting →</a>
-      <a class="btn-ghost" href="/runs/cli1791734448">Open a real report</a>
+      {% if demo_run_id %}
+      <a class="btn-ghost" href="/runs/{{ demo_run_id }}">Open a real report</a>
+      {% else %}
+      <a class="btn-ghost" href="/expedition">Run the first hunt →</a>
+      {% endif %}
     </p>
     <p class="micro">works key-free · ≤4 LLM calls if you add one · every claim re-runnable</p>
   </div>
@@ -81,12 +85,17 @@
 <section id="proof" class="proof">
   <div class="l-shot card">
     <h2 class="card-title">Actual output — nothing staged</h2>
-    <p class="micro">Run #cli1791734448, a full hunt against our own straw-man store.
-    Screenshot, numbers and every bug card below it generated hands-free.</p>
-    <a href="/runs/cli1791734448"><img src="/static/img/qa_results_demo.png" alt="QArena completed run with benchmark 1.0 F1 and specimen cards"></a>
+    <p class="micro">{% if demo_run_id %}Run #{{ demo_run_id }} — the newest completed hunt in this
+    workspace. Screenshot, numbers and every bug card below it generated hands-free.{% else %}No completed
+    hunt in this workspace yet — start one and this section links to its real report.{% endif %}</p>
+    {% if demo_run_id %}
+    <a href="/runs/{{ demo_run_id }}"><img src="/static/img/qa_results_demo.png" alt="QArena run page: filed bug cards with replay-verified evidence"></a>
     <p class="cta-row" style="margin-top:16px">
-      <a class="btn-ghost" href="/runs/cli1791734448">Walk through this run live →</a>
+      <a class="btn-ghost" href="/runs/{{ demo_run_id }}">Walk through this run live →</a>
     </p>
+    {% else %}
+    <img src="/static/img/qa_results_demo.png" alt="QArena run page: filed bug cards with replay-verified evidence">
+    {% endif %}
   </div>
 </section>
 

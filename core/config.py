@@ -24,6 +24,9 @@ MAX_TESTS = 16               # planner output cap executed
 RUN_WALL_CLOCK_S = 480       # whole-run budget
 STEP_TIMEOUT_MS = 3500       # element resolution timeout
 NAV_TIMEOUT_MS = 10000
+CAPTURE_SETTLE_MS = 200      # per-step: let queued browser events arrive before
+                             # the step's evidence window is sliced (Playwright's
+                             # sync API only dispatches events during calls)
 
 # ---- 6-Signal Bug Judge (Stage 5b, weights per architecture table) ------
 SIGNAL_WEIGHTS = {

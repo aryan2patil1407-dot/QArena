@@ -79,6 +79,22 @@ class Tester:
                 ctx.tracing.stop(path=str(self.run_dir / f"trace_{tc.test_id}.zip"))
             except Exception:
                 pass
+        # anything the browser reported after the LAST step's capture window
+        # still belongs to this test — attribute it instead of dropping it
+        if evidences:
+            try:
+                page.wait_for_timeout(config.CAPTURE_SETTLE_MS)
+            except Exception:
+                pass
+            last = evidences[-1]
+            seen_c = sum(len(e.console_errors) for e in evidences)
+            seen_h = sum(len(e.http_failures) for e in evidences)
+            if len(console_errors) > seen_c:
+                last.console_errors = list(last.console_errors) + list(
+                    console_errors[seen_c:])
+            if len(http_failures) > seen_h:
+                last.http_failures = list(last.http_failures) + list(
+                    http_failures[seen_h:])
         ctx.close()
         return verdict, evidences
 
@@ -112,8 +128,15 @@ class Tester:
                  i: int, console_errors: list, http_failures: list,
                  c0: int, h0: int, steps_dir: Path) -> None:
         ev.url_after = page.url
-        ev.console_errors = console_errors[c0:]
-        ev.http_failures = http_failures[h0:]
+        # Playwright's sync API dispatches queued browser events only while a
+        # Playwright call is in flight. Slicing the lists BEFORE the scans below
+        # therefore dropped (or pushed into the next step) failures that landed
+        # just after the action — e.g. a subresource 404 firing right after a
+        # navigation. Pump once, scan, then slice: the step owns its events.
+        try:
+            page.wait_for_timeout(config.CAPTURE_SETTLE_MS)
+        except Exception:
+            pass
         try:
             ev.broken_items = self._dom_scan(page)
             ev.axe_violations = self._axe_scan(page)
@@ -122,6 +145,8 @@ class Tester:
                 page, tc.expected, is_final=(i == len(tc.steps) - 1))
         except Exception:
             pass
+        ev.console_errors = console_errors[c0:]
+        ev.http_failures = http_failures[h0:]
         shot = steps_dir / f"{tc.test_id}_step{spec.step}.png"
         try:
             page.screenshot(path=str(shot))

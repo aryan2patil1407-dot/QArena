@@ -16,4 +16,6 @@ pytest>=8                 # exported suite runner (self-verified green)
 pytest-playwright>=0.5    # exported suite: `page` fixture + --base-url
 # LLM is optional: QArena runs fully key-free (heuristic mode). Set an API key
 # and the 4-call hybrid planner/judge/reporter upgrade kicks in automatically.
+# Install the client explicitly (pinned, it is a fast-moving dependency):
+#   pip install "litellm>=1.60,<2"
 python-dotenv>=1

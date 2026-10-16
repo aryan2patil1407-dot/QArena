@@ -39,11 +39,14 @@ class Reporter:
             ev = pb.evidence
             route = self._route_of(ev.url_after or ev.url_before)
             elem = self._element_of(pb)
-            # merge key includes test_id: co-located signals from the SAME
-            # journey are one defect (promo 500 + "required text missing"),
-            # while distinct journeys landing on the same route+element are
-            # distinct defects (empty-cart pay vs missing-address pay)
-            key = (route, re.sub(r"\s+", " ", elem.lower()).strip(), pb.test_id)
+            # merge key includes test_id AND the signal family: co-located
+            # signals of the SAME family from one journey are one defect, while
+            # distinct journeys landing on the same route+element stay distinct.
+            # Cross-family merging used to fuse unrelated defects (a console
+            # error + an axe contrast violation became one mislabelled bug and
+            # the contrast finding vanished from the filed list).
+            key = (route, re.sub(r"\s+", " ", elem.lower()).strip(),
+                   pb.test_id, pb.group.split(":")[0])
             sev = self._severity(pb)
             if key not in merged:
                 merged[key] = {"pb": pb, "repro": repro, "route": route,
@@ -252,9 +255,13 @@ class Reporter:
         for s in pb.repro_steps:
             if s.action in ("click", "dblclick", "fill", "select", "press"):
                 return s.name or s.role
-        for v in pb.evidence.axe_violations:
-            if v.get("target"):
-                return f"@{v['target'][:40]}"
+        # an axe target describes an accessibility finding only. Using it as a
+        # generic fallback mislabelled other findings (a console error got the
+        # footer selector of an unrelated contrast violation in its title).
+        if g.startswith(("axe:", "a11y:")):
+            for v in pb.evidence.axe_violations:
+                if v.get("target"):
+                    return f"@{v['target'][:40]}"
         return pb.evidence.target or "page"
     @staticmethod
     def _severity(pb: PossibleBug) -> str:

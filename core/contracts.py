@@ -31,6 +31,11 @@ class AppState(BaseModel):
     # instead of reaching it through a real link on the target. A probed route
     # 404ing is NOT an application defect — never report it as one.
     probed: bool = False
+    # provenance: True when the explorer actually SAW a cart-badge style element
+    # on this state. Oracles that assert a badge count may only be planned when
+    # some state really has one — otherwise "badge not found" would be filed as
+    # a defect on apps that never had a badge (false positive).
+    has_cart_badge: bool = False
 
 
 class AppMap(BaseModel):

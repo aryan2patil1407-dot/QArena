@@ -81,10 +81,27 @@ def load_handle(run_id: str):
 
 
 # ---------------------------------------------------------------- pages
+def newest_run_id() -> str:
+    """Run id of the newest completed hunt in this workspace ("" if none).
+
+    The landing page links to a *real* report — hard-coding a run id produced
+    dead links as soon as that artifact directory was gone.
+    """
+    try:
+        runs = [p for p in config.ARTIFACTS.glob("run_*")
+                if (p / "results.json").exists()]
+        if not runs:
+            return ""
+        return max(runs, key=lambda p: p.stat().st_mtime).name[len("run_"):]
+    except Exception:
+        return ""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     """Product homepage — what QArena is and how a hunt works."""
-    return templates.TemplateResponse(request, "landing.html")
+    return templates.TemplateResponse(request, "landing.html",
+                                      {"demo_run_id": newest_run_id()})
 
 
 @app.get("/expedition", response_class=HTMLResponse)

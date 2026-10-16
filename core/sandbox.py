@@ -7,6 +7,7 @@ Stage 2 — Sandbox initialization & safety guard.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -58,8 +59,26 @@ class Sandbox:
             return False
 
     # ---- 2) browser + safety guard ---------------------------------------
+    @staticmethod
+    def browser_override() -> dict:
+        """Optional external browser binary, e.g. a container/CI Chromium.
+
+        Set QARENA_CHROMIUM_PATH to a Chromium/Chrome executable to use an
+        already-available browser instead of Playwright's own download. Unset
+        (the default) keeps the previous behaviour untouched, so nothing
+        changes for normal installs.
+        """
+        exe = os.environ.get("QARENA_CHROMIUM_PATH", "").strip()
+        return {"executable_path": exe} if exe else {}
+
     def start_browser(self) -> Browser:
         self.pw = sync_playwright().start()
+        override = self.browser_override()
+        if override:
+            # a channel name would override the explicit binary; keep it simple
+            self.browser = self.pw.chromium.launch(
+                headless=config.HEADLESS, **override)
+            return self.browser
         try:
             # the bundled "headless shell" (playwright 1.49+) has a bug where
             # fresh contexts in a long-lived browser get net::ERR_FAILED on

@@ -163,6 +163,12 @@ class Explorer:
             pass
 
     # ------------------------------------------------------------- visit one
+    # generic badge probe: any element that looks like a cart/notification
+    # counter. Used only as *provenance* (may we assert a badge on this app?).
+    BADGE_JS = ("() => !!document.querySelector("
+                "'#cart-badge, #cart-count, .cart-count, [id*=\"badge\" i], "
+                "[class*=\"badge\" i], [data-testid*=\"badge\" i]')")
+
     def _visit(self, page, url: str, probed: bool = False):
         try:
             resp = page.goto(url, wait_until="domcontentloaded")
@@ -184,9 +190,15 @@ class Explorer:
         state_id = f"S{len(self.appmap.states):02d}"
         self._seen_hash[shash] = state_id
 
+        try:
+            has_badge = bool(page.evaluate(self.BADGE_JS))
+        except Exception:
+            has_badge = False
+
         state = AppState(
             state_id=state_id, route=route,
             url=page.url, state_hash=shash, http_status=status, probed=probed,
+            has_cart_badge=has_badge,
             elements=[StateElement(id=f"{state_id}e{i}", role=e["role"],
                                    name=e["name"])
                       for i, e in enumerate(elements)])

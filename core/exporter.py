@@ -47,7 +47,34 @@ class Exporter:
             f = self.out_dir / f"test_{self._slug(tc.test_id + '_' + tc.title)}.py"
             f.write_text(body, encoding="utf-8")
             files.append(f.name)
+        self._write_conftest()
         return files
+
+    # shipped next to the exported tests so the suite can run wherever QArena
+    # itself can (e.g. a container Chromium instead of a Playwright download)
+    _CONFTEST = '''"""QArena export support (Stage 7b).
+
+Lets this exported suite use an externally supplied browser when one is
+configured via QARENA_CHROMIUM_PATH (containers/CI images that already have a
+Chromium). Unset -> pytest-playwright's own browser: unchanged behaviour.
+"""
+import os
+
+import pytest
+
+
+@pytest.fixture(scope="session")
+def browser_type_launch_args(browser_type_launch_args):
+    exe = os.environ.get("QARENA_CHROMIUM_PATH", "").strip()
+    if exe:
+        return {**browser_type_launch_args, "executable_path": exe}
+    return browser_type_launch_args
+'''
+
+    def _write_conftest(self) -> None:
+        target = self.out_dir / "conftest.py"
+        if not target.exists():
+            target.write_text(self._CONFTEST, encoding="utf-8")
 
     def self_verify(self, files: list[str]) -> tuple[list[str], str]:
         """Run the just-exported suite and keep only files that truly passed.
