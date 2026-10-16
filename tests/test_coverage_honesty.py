@@ -102,3 +102,22 @@ def test_control_index_ignores_pages_that_were_only_probed():
     pol = RoutePolicy(appmap)
     total = sum(len(s.elements) for s in appmap.states if pol.confirmed(s.route))
     assert total == 4, total       # 2 on home + 2 on the product page, not the probe
+
+
+def test_route_coverage_numerator_never_exceeds_its_denominator(ctx):
+    """A linked page answering 500 is a real route: it counts on both sides."""
+    home = make_state("S00", "/", 200,
+                      [StateElement(id="e1", role="link", name="Reports")],
+                      discovered_via="seed")
+    broken = make_state("S01", "/reports", 500, [], discovered_via="link",
+                        link_name="Reports", discovered_from="/")
+    appmap = make_map([home, broken],
+                      edges=[{"from": "S00", "to": "/reports",
+                              "via": 'link "Reports"'}])
+    run = ctx.run(appmap=appmap, verdict="failed", suspects=[])
+    cov = run.results()["coverage"]
+    assert cov["routes_executed"] <= cov["routes_total"], cov
+    assert cov["routes_total"] == cov["routes_eligible"], cov
+    assert cov["routes_live_count"] == 1, cov      # only / serves 200
+    if cov["route_coverage"] is not None:
+        assert 0 <= cov["route_coverage"] <= 100, cov

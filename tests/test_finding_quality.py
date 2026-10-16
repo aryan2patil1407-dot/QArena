@@ -165,3 +165,42 @@ def test_third_party_network_failure_is_labelled_in_the_report(tmp_path):
     analysis = bug.evidence["network_analysis"][0]
     assert analysis["origin"] == "third_party"
     assert "not owned by the target" in analysis["note"]
+
+
+# --------------------------------------------------- attribution & severity
+def test_element_names_the_link_that_actually_failed(tmp_path):
+    """A page can carry two broken links; the finding must name the right one."""
+    home = make_state("S00", "/", 200, [], discovered_via="seed")
+    dead = make_state("S01", "/old-page", 404, [], discovered_via="link",
+                      link_name="Old Page", discovered_from="/")
+    appmap = make_map([home, dead], edges=[{"from": "S00", "to": "/old-page",
+                                            "via": 'link "Old Page"'}],
+                      app_url="http://site.test")
+    pb = _bug("http:GET /old-page -> 404", "http://site.test/old-page")
+    # the page also hosts an unrelated broken link, listed first
+    pb.evidence.broken_items = [
+        {"kind": "link", "name": "Reports", "detail": "/reports → 500"},
+        {"kind": "link", "name": "Old Page", "detail": "/old-page → 404"}]
+    bug = Reporter(tmp_path, LLMPolicy(), appmap).file_bugs([(pb, "3/3")])[0]
+    assert bug.element_name == "Old Page", bug.element_name
+    assert "Old Page" in bug.title
+
+
+def test_server_error_on_a_linked_page_is_major_not_minor(tmp_path):
+    home = make_state("S00", "/", 200, [], discovered_via="seed")
+    rep = Reporter(tmp_path, LLMPolicy(), make_map([home]))
+    ev = StepEvidence(step=1, action="goto", target="/", status="failed",
+                      url_before="http://site.test/", url_after="http://site.test/reports",
+                      http_failures=[{"method": "GET",
+                                      "url": "http://site.test/reports",
+                                      "status": 500}])
+    pb = PossibleBug(journey="link journey", test_id="TC_7",
+                     group="http:GET /reports -> 500", step_index=0, score=2.5,
+                     summary="500 on /reports",
+                     signals=[SignalHit(signal=2, name="http", weight=2.0,
+                                        evidence="500")],
+                     repro_steps=[StepSpec(step=1, action="goto", target="/")],
+                     evidence=ev)
+    bug = rep.file_bugs([(pb, "3/3")])[0]
+    assert bug.severity == "Major", bug.severity
+    assert "failure page" in bug.evidence["why_it_matters"]

@@ -132,3 +132,21 @@ def test_non_existent_control_is_reported_as_ungrounded_not_as_a_bug():
     cases, rejected = Planner(_docs_site(), FakeLLM(available=False)).plan()
     reasons = {r.get("reason") for r in rejected}
     assert reasons <= {"synthetic_route", "missing_control", "wrong_page", "invented"}
+
+
+def test_every_observed_sibling_page_gets_its_own_journey():
+    """Two product pages share a route template but only one may be broken."""
+    home = make_state("S00", "/", 200,
+                      [StateElement(id="e1", role="link", name="Neon Mug")],
+                      discovered_via="seed")
+    p1 = make_state("S01", "/product/*", 200,
+                    [StateElement(id="e2", role="button", name="Add to Cart")],
+                    discovered_via="link", link_name="Neon Mug")
+    p1.url = "http://site.test/product/1"
+    p2 = make_state("S02", "/product/*", 200,
+                    [StateElement(id="e3", role="button", name="Add to Cart")],
+                    discovered_via="link", link_name="Aurora Lamp")
+    p2.url = "http://site.test/product/2"
+    cases, _ = Planner(make_map([home, p1, p2]), FakeLLM(available=False)).plan()
+    targets = {s.target for c in cases for s in c.steps if s.action == "goto"}
+    assert "/product/1" in targets and "/product/2" in targets, targets

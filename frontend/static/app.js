@@ -278,7 +278,7 @@
       const pct = (v) => (v === null || v === undefined) ? "n/a" : `${v}%`;
       $("cov-row").textContent =
         `Coverage — measured from browser execution, never from the plan: ` +
-        `${pct(c.route_coverage)} of live pages visited (${c.routes_executed ?? c.routes_tested}/${c.routes_total}) · ` +
+        `${pct(c.route_coverage)} of testable pages visited (${c.routes_executed ?? c.routes_tested}/${c.routes_total}) · ` +
         `${pct(c.element_coverage)} of controls exercised (${c.elements_exercised}/${c.elements_total}) · ` +
         `${c.journeys_planned || 0} journeys planned, ${c.journeys_executed || 0} executed` +
         (c.journeys_unexecuted ? `, ${c.journeys_unexecuted} never ran` : "") +

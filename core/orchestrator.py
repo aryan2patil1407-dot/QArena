@@ -474,12 +474,18 @@ class Orchestrator:
 
         return {
             # --- execution-based (the honest headline numbers) --------------
-            "route_coverage": pct(len(executed_ok), len(live)),
+            # denominator = routes the target established (the testable surface),
+            # so the numerator can never exceed it: a linked page that answers
+            # 500 is a real route and counts on both sides of the fraction.
+            "route_coverage": pct(len(executed_ok), len(eligible)),
             # `routes_tested`/`routes_total` are the long-standing keys the API
-            # and dashboard read; `routes_executed`/`routes_live` say the same
-            # thing in the honesty vocabulary. Both describe EXECUTED routes.
-            "routes_tested": len(executed_ok), "routes_total": len(live),
-            "routes_executed": len(executed_ok), "routes_live_count": len(live),
+            # and dashboard read; `routes_executed`/`routes_eligible_count` say
+            # the same thing in the honesty vocabulary. Both describe EXECUTED
+            # routes over the TESTABLE surface.
+            "routes_tested": len(executed_ok), "routes_total": len(eligible),
+            "routes_executed": len(executed_ok),
+            "routes_eligible_count": len(eligible),
+            "routes_live_count": len(live),
             "element_coverage": pct(len(exercised), elements_total),
             "elements_exercised": len(exercised), "elements_total": elements_total,
             # --- route bookkeeping ------------------------------------------

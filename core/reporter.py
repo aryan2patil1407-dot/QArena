@@ -262,13 +262,22 @@ class Reporter:
         p = urlparse(url or "")
         return (re.sub(r"/\d+(?=/|$)", "/*", p.path) or "/").rstrip("/") or "/"
 
-    @staticmethod
-    def _element_of(pb: PossibleBug) -> str:
+    def _element_of(self, pb: PossibleBug) -> str:
         g = pb.group
         # a broken item names the defendant precisely — but ONLY when the bug
         # is actually about that broken thing (every page shares the same
         # broken footer link; it must not own unrelated form bugs)
         if g.startswith(("http:", "broken:")):
+            # match the broken item to the URL that actually failed: a page can
+            # carry several broken links, and the finding must name the one the
+            # journey followed (a 404 report once named a different link)
+            route = self._route_of(pb.evidence.url_after or pb.evidence.url_before)
+            for b in pb.evidence.broken_items:
+                if b.get("name") and route and route in str(b.get("detail") or ""):
+                    return b["name"]
+            src = self.policy.link_source(route) if self.policy is not None else None
+            if src and src.get("link_name"):
+                return src["link_name"]
             for b in pb.evidence.broken_items:
                 if b.get("name"):
                     return b["name"]
@@ -296,15 +305,23 @@ class Reporter:
     def _severity(pb: PossibleBug) -> str:
         blob = (pb.summary + " " + pb.journey).lower()
         sig = {h.signal for h in pb.signals}
+        # read the actual status code rather than the summary text, so the
+        # severity always matches the recorded evidence
+        statuses = {f.get("status") for f in pb.evidence.http_failures}
+        server_error = any(isinstance(s, int) and s >= 500 for s in statuses)
         if "negative" in blob and "$" in blob or "price mismatch" in blob:
             return "Critical"
-        if any("→ 5" in h.evidence for h in pb.signals) and \
-                any(w in blob for w in ("promo", "pay", "checkout", "order")):
+        if server_error and any(w in blob for w in
+                               ("promo", "pay", "checkout", "order", "cart")):
             return "Critical"
-        if 4 in sig or "silently accepted" in blob or "$0.00" in blob \
-                or "badge expected" in blob:
+        if server_error:
+            # a page the target links to or serves returns a server error: the
+            # user gets a failure page instead of content
             return "Major"
-        if 2 in sig and "404" in blob:
+        if 4 in sig or "silently accepted" in blob or "$0.00" in blob \
+                or "badge expected" in blob or "badge" in blob:
+            return "Major"
+        if 2 in sig and ("404" in blob or 404 in statuses):
             return "Minor"
         if sig & {1, 3, 5}:
             return "Minor"

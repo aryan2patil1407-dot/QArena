@@ -7,6 +7,7 @@ deterministic journey-grammar generator (works key-free).
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 from . import config, provenance
 from .contracts import AppMap, ExpectedContract, StepSpec, TestCase
@@ -63,6 +64,23 @@ class Planner:
     def route_real(self, route: str) -> bool:
         """A feature-level route: confirmed AND serving a page right now."""
         return self.policy.exists(route)
+
+    def _concrete_urls(self, frag: str, limit: int = 3) -> list[str]:
+        """Distinct real URLs (not canonical routes) whose route matches `frag`.
+
+        The AppMap canonicalises ids away so that one journey covers a template,
+        but the explorer stores the exact URL it visited — those are the pages a
+        user can actually open, and each one is worth visiting.
+        """
+        want = self._norm(frag)
+        out: list[str] = []
+        for s in self.map.states:
+            if not self.policy.exists(s.route) or want not in self._norm(s.route):
+                continue
+            url = urlparse(s.url or "").path or "/"
+            if url not in out:
+                out.append(url)
+        return out[:limit]
 
     def feature_route(self, *frags: str, default: str = "") -> str:
         """First eligible (link-discovered) route matching any fragment.
@@ -297,14 +315,20 @@ class Planner:
                     # Update and the remaining positive cart may legitimately be
                     # paid. The true invariant: money must never go negative.
                     expected=ExpectedContract(money_non_negative=True)))
-        # --- product detail page console probe -------------------------------
-        if self.has("route", "product"):
-            prod_route = self.route_of("product", "/product/1")
+        # --- product detail pages: console probe -----------------------------
+        # One journey per CONCRETE page the explorer actually visited, not just
+        # the first: sibling pages share a canonical route (/product/1 and
+        # /product/2 are both "/product/*") but only one of them may be broken.
+        # Testing a single representative page hides exactly the defects a user
+        # would hit, so every observed page gets its own check.
+        for i, purl in enumerate(self._concrete_urls("product", limit=3)):
+            title = ("Product page: Add to Cart with a clean console" if i == 0
+                     else f"Product page {purl}: Add to Cart with a clean console")
             T.append(TestCase(
-                test_id=nid(), journey_type="happy_path",
-                title="Product page: Add to Cart with a clean console",
-                steps=[StepSpec(step=1, action="goto", target=prod_route),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart")],
+                test_id=nid(), journey_type="happy_path", title=title,
+                steps=[StepSpec(step=1, action="goto", target=purl),
+                       StepSpec(step=2, action="click", role="button",
+                                name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=None)))
 
         if promo_route and self.has("textbox", "promo") \
