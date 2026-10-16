@@ -36,6 +36,30 @@ class AppState(BaseModel):
     # some state really has one — otherwise "badge not found" would be filed as
     # a defect on apps that never had a badge (false positive).
     has_cart_badge: bool = False
+    # HOW QArena learned this route exists — the field every admissibility
+    # decision reads (see core/provenance.py). One of:
+    #   "seed"        the app root the user handed us
+    #   "link"        reached by following a real link the target published
+    #   "interaction" the target navigated here itself after a real user action
+    #   "probe"       QArena GUESSED this URL (cart/checkout/search enrichment)
+    # A probe-only state that never returned 2xx is not part of the application:
+    # its failure may never be planned against or filed as a defect.
+    discovered_via: str = ""
+    # the page QArena was standing on when it found this state, plus the link's
+    # own label — this is what makes a broken-link report concrete
+    discovered_from: str = ""
+    link_name: str = ""
+    # set on states reached by following a link: what that link predicted
+    # (the href). A 404 here is a broken link; a 404 on a probe is not.
+    linked_href: str = ""
+
+    def provenance_rank(self) -> int:
+        """Lower is stronger evidence: seed(0) link(1) interaction(2) probe(3)."""
+        order = {"seed": 0, "link": 1, "interaction": 2, "probe": 3}
+        via = (self.discovered_via or "").strip().lower()
+        if via in order:
+            return order[via]
+        return 3 if self.probed else 1
 
 
 class AppMap(BaseModel):
@@ -128,10 +152,12 @@ class FiledBug(BaseModel):
     element_name: str = ""
     signals: list[int]
     score: float
-    reproduced_count: str                # "3/3"
+    reproduced_count: str                # "matched/completed" — valid attempts only
     steps_to_reproduce: list[str]
     expected_behavior: str
     actual_behavior: str
+    # what the confidence number is made of (signals + valid reproductions)
+    confidence_basis: str = ""
     evidence: dict = Field(default_factory=dict)  # screenshot/trace/report paths
 
 
@@ -140,6 +166,16 @@ class FlakySuspect(BaseModel):
     summary: str
     reproduced: str                      # "1/3"
     signals: list[int]
+    # "flaky"        replay ran and the defect only sometimes recurred
+    # "inconclusive" replay ran but could not decide (a step errored)
+    # "infrastructure" replay could not run at all (browser/target problem)
+    # Only "flaky" is evidence about the application; the others are evidence
+    # about the test environment and are reported separately.
+    kind: str = "flaky"
+    detail: str = ""                     # why it was inconclusive/infrastructure
+    attempts_matched: int = 0            # completed attempts that reproduced it
+    attempts_completed: int = 0          # attempts that ran to a verdict
+    attempts_total: int = 0              # attempts we tried
 
 
 class RunResult(BaseModel):
@@ -153,8 +189,14 @@ class RunResult(BaseModel):
     tests_planned: int = 0
     tests_passed: int = 0
     steps_executed: int = 0
+    # a planned journey that never produced a verdict (a later stage failed).
+    # Kept separate from tests_passed so coverage cannot overstate what ran.
+    tests_unexecuted: int = 0
     filed_bugs: list[FiledBug] = Field(default_factory=list)
     flaky: list[FlakySuspect] = Field(default_factory=list)
+    # verified findings that may not be published because their evidence rests
+    # on a route QArena invented (never dropped silently — always explained)
+    suppressed: list[dict] = Field(default_factory=list)
     exported_tests: list[str] = Field(default_factory=list)
     rejected_steps: list[dict] = Field(default_factory=list)
     coverage: dict = Field(default_factory=dict)

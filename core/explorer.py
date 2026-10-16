@@ -19,9 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from . import config
+from . import config, provenance
 from .contracts import AppMap, AppState, StateElement
 from .sandbox import Sandbox
+
+_VIA_RANK = {provenance.SEED: 0, provenance.LINK: 1, provenance.INTERACTION: 2,
+             provenance.PROBE: 3}
 
 SIG_ROLES = ("link", "button", "textbox", "searchbox", "spinbutton", "combobox",
              "checkbox", "radio", "img", "heading")
@@ -80,28 +83,34 @@ class Explorer:
 
         start = self.sbx.target_url + "/"
         guest_links = self._guest_nav_links()   # /login, /signup when logged in
-        frontier: deque[tuple[str, int]] = deque([(start, 0)])
+        # (url, depth, provenance, discovered_from, link_name)
+        frontier: deque[tuple[str, int, str, str, str]] = deque(
+            [(start, 0, provenance.SEED, "", "")])
         for gl in guest_links:
-            frontier.append((gl, 0))
+            frontier.append((gl, 0, provenance.LINK, "/", "guest navigation"))
         actions = 0
 
         while frontier and actions < config.MAX_CRAWL_ACTIONS \
                 and len(self.appmap.states) < config.MAX_STATES:
-            url, depth = frontier.popleft()
+            url, depth, via, from_route, link_name = frontier.popleft()
             if url in self._visited_urls or not self._in_scope(url):
                 continue
             self._visited_urls.add(url)
             state, links, has_search = self._visit(
-                page, url, probed=url in self._probed_urls)
+                page, url, probed=(via == provenance.PROBE), via=via,
+                discovered_from=from_route, link_name=link_name)
             actions += 1
             if state is None:
                 continue
-            # enqueue discovered links (GET-only navigation)
+            # enqueue discovered links (GET-only navigation). A link the target
+            # published is real evidence: the route is the app's own claim.
             if depth < 3:
                 for href, lname in links:
                     nxt = urljoin(url, href)
                     if self._in_scope(nxt) and nxt not in self._visited_urls:
-                        frontier.append((nxt.split("#")[0], depth + 1))
+                        frontier.append((nxt.split("#")[0], depth + 1,
+                                         provenance.LINK,
+                                         canonical_route(page.url), lname))
                         self.appmap.edges.append(
                             {"from": state.state_id, "to": canonical_route(nxt),
                              "via": f'link "{lname}"'})
@@ -111,7 +120,8 @@ class Explorer:
                 if self._in_scope(probe) and probe not in self._visited_urls:
                     # QArena-synthesised URL => probed, never a reportable route
                     self._probed_urls.add(probe)
-                    frontier.append((probe, depth + 1))
+                    frontier.append((probe, depth + 1, provenance.PROBE, "/",
+                                     "search box"))
                     self.appmap.edges.append(
                         {"from": state.state_id, "to": "/search",
                          "via": 'searchbox "Search"'})
@@ -144,23 +154,64 @@ class Explorer:
     def _populate_cart_probe(self) -> None:
         """Probe: add one item, then re-visit /cart and /checkout so their
         elements (Quantity spinbutton, Promo code, Pay Now…) enter the AppMap.
-        Classic crawler enrichment — some states only exist after a mutation."""
+        Classic crawler enrichment — some states only exist after a mutation.
+
+        Two very different things can happen here, and the difference matters:
+
+        * the app navigates somewhere itself after "Add to Cart" → that URL is
+          the application's own route (``interaction``); a failure on it is a
+          real defect (the button is broken).
+        * QArena's guessed /cart and /checkout URLs are only probes. A 404 on
+          one of those says nothing about the site, so it stays a probe and can
+          never be reported as a defect.
+        """
         try:
             ctx = self.sbx.new_context(with_auth=True)
             page = ctx.new_page()
             page.goto(self.sbx.target_url + "/", wait_until="domcontentloaded")
+            before = page.url
             btn = page.get_by_role("button", name="Add to Cart")
             if btn.count():
                 btn.first.click()
                 page.wait_for_timeout(600)
+            after = page.url.rstrip("/") or page.url
+            if after != before.rstrip("/"):
+                # the target navigated on its own — record that real journey
+                self._visit(page, after, probed=False,
+                            via=provenance.INTERACTION,
+                            discovered_from=canonical_route(before),
+                            link_name="Add to Cart")
             # probed=True: these URLs are QArena's guesses, not links found on
             # the target. If one 404s that is NOT an application defect, so the
             # planner must never raise a dead-route report for them.
-            self._visit(page, self.sbx.target_url + "/cart", probed=True)
-            self._visit(page, self.sbx.target_url + "/checkout", probed=True)
+            self._visit(page, self.sbx.target_url + "/cart", probed=True,
+                        via=provenance.PROBE, link_name="cart probe")
+            self._visit(page, self.sbx.target_url + "/checkout", probed=True,
+                        via=provenance.PROBE, link_name="checkout probe")
             ctx.close()
         except Exception:
             pass
+
+    def _upgrade_provenance(self, route: str, via: str,
+                            discovered_from: str, link_name: str) -> None:
+        """Keep the strongest provenance seen for a canonical route.
+
+        A route the crawler guessed and later found through a real link IS a
+        real route; dropping that fact would silently keep an application
+        route unusable just because the probe visited it first.
+        """
+        if via == provenance.PROBE:
+            return
+        for s in self.appmap.states:
+            if canonical_route(s.route or s.url) != canonical_route(route):
+                continue
+            if s.provenance_rank() <= _VIA_RANK.get(via, 4):
+                s.discovered_via = via
+                s.probed = False
+                if discovered_from and not s.discovered_from:
+                    s.discovered_from = discovered_from
+                if link_name and not s.link_name:
+                    s.link_name = link_name
 
     # ------------------------------------------------------------- visit one
     # generic badge probe: any element that looks like a cart/notification
@@ -169,7 +220,8 @@ class Explorer:
                 "'#cart-badge, #cart-count, .cart-count, [id*=\"badge\" i], "
                 "[class*=\"badge\" i], [data-testid*=\"badge\" i]')")
 
-    def _visit(self, page, url: str, probed: bool = False):
+    def _visit(self, page, url: str, probed: bool = False, via: str = "",
+               discovered_from: str = "", link_name: str = ""):
         try:
             resp = page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(350)
@@ -183,8 +235,15 @@ class Explorer:
             snap = ""
         elements = parse_aria_snapshot(snap)
         route = canonical_route(page.url)
+        if via == "":
+            # caller did not say how we got here: fall back to the flag
+            via = provenance.PROBE if probed else provenance.LINK
         shash = state_signature(route, elements, status)
         if shash in self._seen_hash and status == 200:
+            # already mapped — but a BETTER provenance must not be lost: a route
+            # first guessed and later reached through a real link is a real
+            # route (the probe simply happened to get there first)
+            self._upgrade_provenance(route, via, discovered_from, link_name)
             return None, [], False  # already-visited identical state
 
         state_id = f"S{len(self.appmap.states):02d}"
@@ -197,8 +256,14 @@ class Explorer:
 
         state = AppState(
             state_id=state_id, route=route,
-            url=page.url, state_hash=shash, http_status=status, probed=probed,
+            url=page.url, state_hash=shash, http_status=status,
+            probed=(via == provenance.PROBE),
             has_cart_badge=has_badge,
+            # HOW this page was discovered — the field every admissibility
+            # decision reads (a probe is never evidence about the application)
+            discovered_via=via, discovered_from=discovered_from,
+            link_name=link_name,
+            linked_href=url if via == provenance.LINK else "",
             elements=[StateElement(id=f"{state_id}e{i}", role=e["role"],
                                    name=e["name"])
                       for i, e in enumerate(elements)])

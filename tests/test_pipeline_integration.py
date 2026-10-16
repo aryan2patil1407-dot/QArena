@@ -32,6 +32,7 @@ class FakeSandbox:
 
     def __init__(self, url: str, run_dir: Path) -> None:
         self.url, self.run_dir = url, run_dir
+        self.base_host = url.replace("http://", "").replace("https://", "").split("/")[0]
         self.calls: list[str] = []
         self.shut_down = False
 
@@ -62,11 +63,16 @@ class FakeExplorer:
         am = AppMap(app_url=TARGET, description=description)
         am.states = [
             AppState(state_id="S00", route="/", url=TARGET + "/",
-                     state_hash="h0", http_status=200,
+                     state_hash="h0", http_status=200, discovered_via="seed",
                      elements=[StateElement(id="S00e0", role="link", name="Basket")]),
+            # /cart was reached by following the home page's OWN "Basket" link —
+            # that link is what makes a failure there reportable (a URL QArena
+            # merely guessed would not be). The crawl graph records the link.
             AppState(state_id="S01", route="/cart", url=TARGET + "/cart",
-                     state_hash="h1", http_status=200),
+                     state_hash="h1", http_status=200, discovered_via="link",
+                     link_name="Basket", discovered_from="/"),
         ]
+        am.edges = [{"from": "S00", "to": "/cart", "via": 'link "Basket"'}]
         for st in am.states:                       # the real explorer reports each
             self.emit({"type": "state", "state_id": st.state_id,
                        "route": st.route, "status": st.http_status,
@@ -84,7 +90,10 @@ class FakePlanner:
                       steps=[StepSpec(step=1, action="goto", target="/"),
                              StepSpec(step=2, action="goto", target="/cart")],
                       expected=ExpectedContract())
+        # same shape the real `Planner.reject_invented` returns: the reason is
+        # part of the contract so the dashboard can say WHY a step was refused
         rejected = [{"test_id": "TC_002", "title": "Invented journey",
+                     "reason": "missing_control",
                      "invented_steps": ['click button "Pay Now"']}]
         return [tc], rejected
 
@@ -114,14 +123,21 @@ class FakeVerifier:
 
     def verify(self, pb):
         """Same contract as the real pass^3 gate: fresh context per attempt,
-        one `replay` event per attempt, a count of clean-browser reproductions."""
+        one `replay` event per attempt, a count of clean-browser reproductions,
+        and a classified outcome (matched / not_reproduced / inconclusive /
+        infrastructure_error)."""
+        from core.verifier import MATCHED, NOT_REPRODUCED, ReplayOutcome
         hits = 0
         for attempt in (1, 2, 3):
             self.tester.sbx.seed_target()
             hits += 1
             self.emit({"type": "replay", "journey": f"{pb.test_id} {pb.group}",
                        "attempt": attempt, "matched": True})
-        return hits >= 2, f"{hits}/3"
+        outcome = ReplayOutcome(
+            attempts=3, completed=3, matched=hits,
+            kind=MATCHED if hits >= 2 else NOT_REPRODUCED,
+            detail=f"reproduced {hits}/3 completed clean-browser replays")
+        return outcome.confirmed, outcome.summary(), outcome
 
 
 @pytest.fixture()
@@ -164,8 +180,11 @@ def test_stages_2_to_8_complete_and_artifacts_agree(pipeline):
     assert res.states_found == 2
     assert res.tests_planned == 1
     assert res.stage_errors == {}
+    # the title now names the target's OWN broken link and the request that
+    # failed, because that is the actionable fact (previously "Basket: Network
+    # Failures — …" never said who published the link)
     assert [b.title for b in res.filed_bugs] == [
-        "Basket: Network Failures — GET https://sweetshop.test/cart → 404"]
+        'Broken link "Basket" on / — GET https://sweetshop.test/cart → 404']
 
     # the whole pipeline reported itself: stages, log lines, states, plan,
     # verdict, suspect, replay proof and the confirmation
@@ -264,7 +283,11 @@ def test_flaky_and_confirmed_are_kept_distinct(pipeline, monkeypatch):
     h = pipeline("itest00005")
 
     def one_of_three(self, pb):
-        return False, "1/3"
+        from core.verifier import NOT_REPRODUCED, ReplayOutcome
+        out = ReplayOutcome(attempts=3, completed=3, matched=1,
+                            kind=NOT_REPRODUCED,
+                            detail="reproduced 1/3 completed replays")
+        return False, out.summary(), out
 
     monkeypatch.setattr(orch_mod.Verifier, "verify", one_of_three)
     run_pipeline(h)
@@ -280,9 +303,10 @@ def test_flaky_and_confirmed_are_kept_distinct(pipeline, monkeypatch):
 def test_rejected_steps_are_reported_not_hidden(pipeline):
     h = pipeline("itest00006")
     run_pipeline(h)
-    assert h.result.rejected_steps == [
-        {"test_id": "TC_002", "title": "Invented journey",
-         "invented_steps": ['click button "Pay Now"']}]
+    assert [r["test_id"] for r in h.result.rejected_steps] == ["TC_002"]
+    assert h.result.rejected_steps[0]["invented_steps"] == ['click button "Pay Now"']
+    # the rejection says WHY, so the dashboard can explain it
+    assert h.result.rejected_steps[0]["reason"]
     plan = [e for e in h.history if e["type"] == "plan"][0]
     assert plan["rejected"] == 1
 

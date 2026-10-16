@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config
 from .contracts import (FiledBug, FlakySuspect, PossibleBug, RunResult,
                         TestCase)
+from .provenance import RoutePolicy, canonical_route as route_of_url
 from .explorer import Explorer
 from .exporter import Exporter
 from .judge import Judge
@@ -202,7 +203,11 @@ class Orchestrator:
             judge = Judge(llm)
             verifier = Verifier(tester, judge, emit)
             passed_cases: list[TestCase] = []
+            executed_cases: list[tuple[TestCase, str, list]] = []
+            errored_cases: list[TestCase] = []
             suspects: list[PossibleBug] = []
+            routes_executed: set[str] = set()
+            controls_exercised: set[tuple[str, str]] = set()
 
             for tc in cases:
                 stage(5, f"Tester × Judge — {tc.test_id}: {tc.title[:48]}")
@@ -210,6 +215,21 @@ class Orchestrator:
                 verdict, evidences = tester.run_test(tc, tracing=True)
                 res.steps_executed += len(evidences)
                 emit({"type": "verdict", "test": tc.test_id, "verdict": verdict})
+                # execution facts, taken from what the browser actually did — never
+                # from the plan (a planned journey that never ran is not coverage).
+                # verdict == "error" means the journey could not be driven at all,
+                # so its steps are not evidence of coverage either.
+                if verdict == "error":
+                    errored_cases.append(tc)
+                if verdict in ("passed", "failed"):
+                    executed_cases.append((tc, verdict, evidences))
+                    for i, ev in enumerate(evidences):
+                        for u in (ev.url_before, ev.url_after):
+                            if u:
+                                routes_executed.add(route_of_url(u))
+                        spec = tc.steps[i] if i < len(tc.steps) else None
+                        if spec is not None and spec.role:
+                            controls_exercised.add((spec.role, spec.name))
                 test_suspects: list[PossibleBug] = []
                 for i, ev in enumerate(evidences):
                     for pb in judge.evaluate(tc.title, tc.test_id, i, ev,
@@ -255,18 +275,51 @@ class Orchestrator:
 
             # ------------------------------- STAGE 6a: replay verification
             stage(6, "Replay Verifier — proving suspects in clean browsers")
-            confirmed: list[tuple[PossibleBug, str]] = []
+            # Evidence admissibility gate: a finding whose evidence was taken on
+            # a route QArena invented is not a finding about the target. Drop it
+            # BEFORE replay — repeating an invented navigation cannot make it
+            # true, and "it happened 3/3 times" would be pure theatre.
+            admiss: list[PossibleBug] = []
+            policy = RoutePolicy(appmap)
             for pb in suspects:
-                ok, count = verifier.verify(pb)
+                reason = policy.blocked_reason(pb.evidence.url_after
+                                               or pb.evidence.url_before)
+                if reason:
+                    res.suppressed.append({
+                        "journey": pb.journey, "test_id": pb.test_id,
+                        "group": pb.group, "summary": pb.summary[:200],
+                        "reason": reason,
+                        "signals": [s.signal for s in pb.signals]})
+                    emit({"type": "suppressed", "journey": pb.journey,
+                          "reason": reason})
+                else:
+                    admiss.append(pb)
+            if res.suppressed:
+                emit({"type": "log",
+                      "msg": f"{len(res.suppressed)} suspect(s) withheld: their "
+                             f"evidence came from a route QArena probed itself"})
+
+            confirmed: list[tuple[PossibleBug, str]] = []
+            for pb in admiss:
+                ok, count, outcome = verifier.verify(pb)
                 if ok:
                     confirmed.append((pb, count))
                     emit({"type": "confirmed", "journey": f"{pb.test_id} {pb.group}",
                           "count": count})
                 else:
+                    # a clean non-reproduction (flaky) is evidence about the app;
+                    # an inconclusive or infrastructure-broken replay is evidence
+                    # about the test environment. Keep them apart and never call
+                    # a crashed replay a "flaky" defect.
                     res.flaky.append(FlakySuspect(
                         journey=f"{pb.journey} [{pb.group}]", summary=pb.summary[:200],
-                        reproduced=count, signals=[s.signal for s in pb.signals]))
-                    emit({"type": "flaky", "journey": pb.journey, "count": count})
+                        reproduced=count, signals=[s.signal for s in pb.signals],
+                        kind=outcome.kind, detail=outcome.detail,
+                        attempts_matched=outcome.matched,
+                        attempts_completed=outcome.completed,
+                        attempts_total=outcome.attempts))
+                    emit({"type": "flaky", "journey": pb.journey, "count": count,
+                          "kind": outcome.kind, "detail": outcome.detail})
                 # incremental safekeeping: each proof lands on disk as it is made,
                 # so even a crash inside the replay loop cannot lose it
                 self._persist_confirmed(h, confirmed)
@@ -278,13 +331,21 @@ class Orchestrator:
 
             # ------------------------------- STAGE 7a: dedup + reports
             stage(7, "Reporter — dedup, severity, human-quality reports")
-            reporter = Reporter(h.run_dir, llm)
+            reporter = Reporter(h.run_dir, llm, appmap)
             filed = guarded("reporter", lambda: reporter.file_bugs(confirmed))
             if filed is None:
                 # reporting died as a whole: still surface the proven findings
                 # through the fallback filer (facts unchanged, prose canonical)
                 filed = reporter.fallback_file_bugs(confirmed)
             res.filed_bugs = filed
+            # the reporter's own synthetic-route safety net may have withheld
+            # more suspects: keep the run's accounts complete
+            if reporter.suppressed:
+                res.suppressed.extend(
+                    s for s in reporter.suppressed
+                    if not any(x.get("test_id") == s.get("test_id")
+                               and x.get("group") == s.get("group")
+                               for x in res.suppressed))
             self._save(h)
 
             # ------------------------------- STAGE 7b: export + self-verify
@@ -301,7 +362,14 @@ class Orchestrator:
             keep = guarded("exporter", _export)
             res.exported_tests = keep if keep is not None else []
             res.tests_passed = len(passed_cases)
-            res.coverage = self._coverage(appmap, cases, passed_cases)
+            # a planned journey with no verdict never ran to completion (a stage
+            # failed) — counted separately so coverage cannot overstate itself
+            res.tests_unexecuted = max(0, len(cases) - len(executed_cases))
+            res.coverage = self._coverage(
+                appmap, cases, executed_cases, passed_cases,
+                routes_executed, controls_exercised,
+                suppressed=len(res.suppressed), rejected=len(rejected),
+                errored=len(errored_cases))
 
             # ------------------------------- STAGE 8: benchmark
             stage(8, "Benchmark — precision / recall / F1 vs ground truth")
@@ -360,31 +428,83 @@ class Orchestrator:
 
     @staticmethod
     def _route_of(pb: PossibleBug) -> str:
-        import re
-        from urllib.parse import urlparse
-        url = pb.evidence.url_after or pb.evidence.url_before or ""
-        return (re.sub(r"/\d+(?=/|$)", "/*", urlparse(url).path) or "/").rstrip("/") or "/"
+        return route_of_url(pb.evidence.url_after or pb.evidence.url_before or "")
 
     @staticmethod
-    def _coverage(appmap, cases, passed) -> dict:
-        routes_hit = set()
-        for tc in cases:
-            for st in tc.steps:
-                if st.action == "goto":
-                    routes_hit.add(st.target)
-        total_routes = len({s.route for s in appmap.states if s.http_status == 200})
+    def _coverage(appmap, cases, executed_cases, passed, routes_executed,
+                  controls_exercised, suppressed: int = 0, rejected: int = 0,
+                  errored: int = 0) -> dict:
+        """Honest coverage: measured from execution, never from the plan.
+
+        Definitions (these are the labels the dashboard shows):
+
+        * ``routes_discovered``   every canonical route the explorer saw
+        * ``routes_eligible``     routes the target established (linked/served) —
+                                  the only routes anyone may test
+        * ``routes_live``         eligible routes that are actually serving a page
+        * ``routes_planned``      routes named in the plan, executed or not
+        * ``routes_executed``     eligible routes the browser really visited
+        * ``probe_only_routes``   URLs QArena guessed that the target never
+                                  confirmed — excluded from testing by design
+        * ``elements_total``      controls on eligible pages (the testable surface)
+        * ``elements_exercised``  mapped controls an executed step really used
+
+        A route or control that merely appeared in a plan is NOT counted as
+        coverage. Zero denominators are reported as ``*_pct = None`` (unavailable)
+        rather than as a fake 0% or 100%.
+        """
+        policy = RoutePolicy(appmap)
+        eligible = policy.eligible_routes()
+        live = policy.live_routes()
+        discovered = set(policy._by_route)
+        planned = {st.target for tc in cases for st in tc.steps
+                   if st.action == "goto"}
+        executed_ok = {r for r in routes_executed if r in eligible}
+
         elements_total = sum(len(s.elements) for s in appmap.states
-                             if s.http_status == 200)
-        exercised = set()
-        for tc in cases:
-            for st in tc.steps:
-                if st.role:
-                    exercised.add((st.role, st.name))
+                             if policy.confirmed(s.route))
+        mapped_controls = {(e.role, e.name) for s in appmap.states
+                           if policy.confirmed(s.route) for e in s.elements}
+        exercised = {c for c in controls_exercised if c in mapped_controls}
+        planned_controls = {(st.role, st.name) for tc in cases for st in tc.steps
+                            if st.role and st.action != "goto"}
+
+        def pct(num: int, den: int):
+            return round(min(1.0, num / den) * 100, 1) if den else None
+
         return {
-            "route_coverage": round(min(1.0, len(routes_hit) / max(total_routes, 1)) * 100, 1),
-            "routes_tested": len(routes_hit), "routes_total": total_routes,
-            "element_coverage": round(min(1.0, len(exercised) / max(elements_total, 1)) * 100, 1),
+            # --- execution-based (the honest headline numbers) --------------
+            "route_coverage": pct(len(executed_ok), len(live)),
+            # `routes_tested`/`routes_total` are the long-standing keys the API
+            # and dashboard read; `routes_executed`/`routes_live` say the same
+            # thing in the honesty vocabulary. Both describe EXECUTED routes.
+            "routes_tested": len(executed_ok), "routes_total": len(live),
+            "routes_executed": len(executed_ok), "routes_live_count": len(live),
+            "element_coverage": pct(len(exercised), elements_total),
             "elements_exercised": len(exercised), "elements_total": elements_total,
+            # --- route bookkeeping ------------------------------------------
+            "routes_discovered": len(discovered),
+            "routes_eligible": len(eligible),
+            "routes_live": len(live),
+            "routes_planned": len(planned),
+            "routes_planned_not_executed": sorted(planned - executed_ok),
+            "probe_only_routes": sorted(r for r in discovered if not policy.confirmed(r)),
+            # --- control bookkeeping ----------------------------------------
+            "controls_planned": len(planned_controls),
+            "controls_planned_never_exercised": sorted(
+                f"{r} {n}".strip() for r, n in (planned_controls - exercised)),
+            # --- journey bookkeeping ----------------------------------------
+            "journeys_planned": len(cases),
+            "journeys_executed": len(executed_cases),
+            "journeys_passed": sum(1 for _, v, _ in executed_cases if v == "passed"),
+            "journeys_failed": sum(1 for _, v, _ in executed_cases if v == "failed"),
+            # a journey that produced no verdict at all (a stage died / the
+            # browser could not drive it) is NOT executed coverage
+            "journeys_errored": errored,
+            "journeys_unexecuted": max(0, len(cases) - len(executed_cases)),
+            "journeys_rejected_ungrounded": rejected,
+            "findings_withheld_synthetic": suppressed,
+            "measured_from": "browser execution evidence (not the test plan)",
         }
 
     @staticmethod

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import re
 
-from . import config
+from . import config, provenance
 from .contracts import AppMap, ExpectedContract, StepSpec, TestCase
 from .llm import LLMPolicy
+from .provenance import RoutePolicy
 
 DESCRIPTION_WORDS = ("sign up", "signup", "log in", "login", "search", "cart",
                      "promo", "coupon", "checkout", "order", "pay")
@@ -20,6 +21,10 @@ class Planner:
     def __init__(self, appmap: AppMap, llm: LLMPolicy) -> None:
         self.map = appmap
         self.llm = llm
+        # route provenance: the single authority on which routes are real.
+        # A URL QArena merely guessed is not an application route, so it may
+        # neither be planned against nor reported on (see core/provenance.py).
+        self.policy = RoutePolicy(appmap)
         self.element_index = self._index_elements()
         # real catalog names only: an invented product name here produced
         # reports about products the target does not have — never fabricate
@@ -33,6 +38,10 @@ class Planner:
     def _index_elements(self) -> dict[str, set[str]]:
         idx: dict[str, set[str]] = {}
         for s in self.map.states:
+            # controls QArena saw on a page it merely guessed at are not proof
+            # that the application has that control
+            if not self.policy.confirmed(s.route):
+                continue
             for e in s.elements:
                 idx.setdefault(e.role, set()).add(self._norm(e.name))
         return idx
@@ -43,14 +52,36 @@ class Planner:
 
     def has(self, role: str, name_frag: str) -> bool:
         if role == "route":
+            # must be a route the target actually serves — a guessed URL that
+            # only ever 404'd is not a feature of this application
             return any(self._norm(name_frag) in self._norm(s.route)
-                       for s in self.map.states)
+                       for s in self.map.states
+                       if self.policy.exists(s.route))
         frag = self._norm(name_frag)
         return any(frag in n for n in self.element_index.get(role, set()))
+
+    def route_real(self, route: str) -> bool:
+        """A feature-level route: confirmed AND serving a page right now."""
+        return self.policy.exists(route)
+
+    def feature_route(self, *frags: str, default: str = "") -> str:
+        """First eligible (link-discovered) route matching any fragment.
+
+        Applies the same provenance rule to the LLM path as to the grammar:
+        a journey may only navigate to a route the target established.
+        """
+        for s in self.map.states:
+            if not self.policy.exists(s.route):
+                continue
+            if all(self._norm(f) in self._norm(s.route) for f in frags):
+                return s.route.replace("/*", "/1")
+        return default
 
     def named(self, role: str, fragments) -> str:
         """First mapped element (original casing) whose name matches a fragment."""
         for s in self.map.states:
+            if not self.policy.confirmed(s.route):
+                continue
             for e in s.elements:
                 if e.role == role and any(f in self._norm(e.name)
                                           for f in fragments):
@@ -60,7 +91,8 @@ class Planner:
     def route_of(self, frag: str, default: str) -> str:
         f = self._norm(frag)
         for s in self.map.states:
-            if self._norm(f) in self._norm(s.route) and s.http_status == 200:
+            if self._norm(f) in self._norm(s.route) and s.http_status == 200 \
+                    and self.policy.confirmed(s.route):
                 return s.route.replace("/*", "/1")
         return default
 
@@ -69,11 +101,50 @@ class Planner:
         cases = self.llm_plan() if self.llm.available else []
         if not cases:
             cases = self.grammar_plan()
+        else:
+            # an LLM's proposal is a *hypothesis*: it must clear the same
+            # grounding gate as the heuristic grammar before anything runs
+            cases = self._ground_llm_cases(cases)
         valid, rejected = self.reject_invented(cases)
         for tc in valid:
             tc.priority_score = self.priority(tc)
         valid.sort(key=lambda t: t.priority_score, reverse=True)
         return valid[: config.MAX_TESTS], rejected
+
+    def feature_inventory(self) -> dict:
+        """What the target actually has — the planner's only source of truth."""
+        return {
+            "routes": sorted(self.policy.live_routes()),
+            "eligible_routes": sorted(self.policy.eligible_routes()),
+            "probe_only_routes": sorted(
+                r for r in self.policy._by_route if not self.policy.confirmed(r)),
+            "controls": {role: sorted(names)[:40]
+                         for role, names in self.element_index.items()},
+            "has_badge": self.has_badge,
+            "products": self.products,
+        }
+
+    def _ground_llm_cases(self, cases: list[TestCase]) -> list[TestCase]:
+        """Keep LLM journeys that reference real routes and real controls.
+
+        The model is allowed to be creative about *scenarios*; it is not allowed
+        to invent pages or buttons. Unusable journeys are dropped here and are
+        reported by ``reject_invented`` like any other ungrounded proposal.
+        """
+        inv = self.feature_inventory()
+        live = set(inv["routes"])
+        out: list[TestCase] = []
+        for tc in cases:
+            ok = True
+            for st in tc.steps:
+                if st.action == "goto":
+                    pat = re.sub(r"/\d+(?=/|$)", "/*", st.target)
+                    if st.target not in live and pat not in live:
+                        ok = False
+                        break
+            if ok:
+                out.append(tc)
+        return out
 
     # ------------------------------------------------- LLM #1 (optional)
     def llm_plan(self) -> list[TestCase]:
@@ -161,6 +232,13 @@ class Planner:
                 expected=(ExpectedContract(text_required=[logout]) if logout
                           else ExpectedContract(disallowed_url="/login"))))
 
+        # A feature journey may only navigate to a route the target itself
+        # established (linked to it, or served it). A guessed /cart answering
+        # 404 is not a broken cart: the site simply has no such route.
+        cart_route = self.feature_route("cart")
+        promo_route = self.feature_route("cart") if self.has("textbox", "promo") else ""
+        checkout_route = self.feature_route("checkout", "check-out", "pay")
+
         # --- search intent ---------------------------------------------------
         if self.has("searchbox", "") and prod:
             T.append(TestCase(
@@ -188,35 +266,37 @@ class Planner:
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="dblclick", role="button", name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=1)))
-        if can_cart:
+        if can_cart and cart_route and self.has("spinbutton", "quantity") \
+                and self.has("button", "update"):
             T.append(TestCase(
                 test_id=nid(), journey_type="edge_case_negative",
                 title="Cart rejects negative quantity (-5)",
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/cart"),
+                       StepSpec(step=3, action="goto", target=cart_route),
                        StepSpec(step=4, action="fill", role="spinbutton", name="Quantity", value="-5"),
                        StepSpec(step=5, action="click", role="button", name="Update")],
                 expected=ExpectedContract(should_reject=True,
                                           error_text="between 1 and 10",
                                           money_non_negative=True)))
-            T.append(TestCase(
-                test_id=nid(), journey_type="adversarial",
-                title="Negative quantity must never produce a negative money total",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/cart"),
-                       StepSpec(step=4, action="fill", role="spinbutton", name="Quantity", value="-5"),
-                       StepSpec(step=5, action="click", role="button", name="Update"),
-                       StepSpec(step=6, action="goto", target="/checkout"),
-                       StepSpec(step=7, action="fill", role="textbox", name="Full name", value="Neg Tester"),
-                       StepSpec(step=8, action="fill", role="textbox", name="Email", value="neg@qarena.dev"),
-                       StepSpec(step=9, action="fill", role="textbox", name="Street address", value="1 Bug Lane"),
-                       StepSpec(step=10, action="click", role="button", name="Pay Now")],
-                # NOT should_reject: on a correct app the -5 is rejected at
-                # Update and the remaining positive cart may legitimately be
-                # paid. The true invariant: money must never go negative.
-                expected=ExpectedContract(money_non_negative=True)))
+            if checkout_route and self.has("button", "pay"):
+                T.append(TestCase(
+                    test_id=nid(), journey_type="adversarial",
+                    title="Negative quantity must never produce a negative money total",
+                    steps=[StepSpec(step=1, action="goto", target="/"),
+                           StepSpec(step=2, action="click", role="button", name="Add to Cart"),
+                           StepSpec(step=3, action="goto", target=cart_route),
+                           StepSpec(step=4, action="fill", role="spinbutton", name="Quantity", value="-5"),
+                           StepSpec(step=5, action="click", role="button", name="Update"),
+                           StepSpec(step=6, action="goto", target=checkout_route),
+                           StepSpec(step=7, action="fill", role="textbox", name="Full name", value="Neg Tester"),
+                           StepSpec(step=8, action="fill", role="textbox", name="Email", value="neg@qarena.dev"),
+                           StepSpec(step=9, action="fill", role="textbox", name="Street address", value="1 Bug Lane"),
+                           StepSpec(step=10, action="click", role="button", name="Pay Now")],
+                    # NOT should_reject: on a correct app the -5 is rejected at
+                    # Update and the remaining positive cart may legitimately be
+                    # paid. The true invariant: money must never go negative.
+                    expected=ExpectedContract(money_non_negative=True)))
         # --- product detail page console probe -------------------------------
         if self.has("route", "product"):
             prod_route = self.route_of("product", "/product/1")
@@ -227,13 +307,14 @@ class Planner:
                        StepSpec(step=2, action="click", role="button", name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=None)))
 
-        if self.has("textbox", "promo"):
+        if promo_route and self.has("textbox", "promo") \
+                and self.has("button", "apply"):
             T.append(TestCase(
                 test_id=nid(), journey_type="happy_path",
                 title="Promo SAVE10 applies a 10% discount",
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/cart"),
+                       StepSpec(step=3, action="goto", target=promo_route),
                        StepSpec(step=4, action="fill", role="textbox", name="Promo code", value="SAVE10"),
                        StepSpec(step=5, action="click", role="button", name="Apply")],
                 expected=ExpectedContract(text_required=["Promo"], no_new_errors_5xx=True)))
@@ -242,90 +323,126 @@ class Planner:
                 title="Unknown promo code fails gracefully",
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/cart"),
+                       StepSpec(step=3, action="goto", target=promo_route),
                        StepSpec(step=4, action="fill", role="textbox", name="Promo code", value="XXX-NOPE"),
                        StepSpec(step=5, action="click", role="button", name="Apply")],
                 expected=ExpectedContract(should_reject=True,
                                           error_text="Invalid promo code")))
 
         # --- checkout ---------------------------------------------------------
-        if self.has("route", "checkout"):
-            T.append(TestCase(
-                test_id=nid(), journey_type="edge_case_negative",
-                title="Checkout blocks empty cart",
-                steps=[StepSpec(step=1, action="goto", target="/checkout"),
-                       StepSpec(step=2, action="click", role="button", name="Pay Now")],
-                expected=ExpectedContract(should_reject=True,
-                                          disallowed_url="/order",
-                                          text_forbidden=["Order confirmed"],
-                                          error_text="cart is empty")))
-            T.append(TestCase(
-                test_id=nid(), journey_type="edge_case_negative",
-                title="Checkout requires shipping address",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/checkout"),
-                       StepSpec(step=4, action="fill", role="textbox", name="Full name", value="No Addr"),
-                       StepSpec(step=5, action="fill", role="textbox", name="Email", value="noaddr@qarena.dev"),
-                       StepSpec(step=6, action="click", role="button", name="Pay Now")],
-                expected=ExpectedContract(should_reject=True, error_text="address is required",
-                                          text_forbidden=["Order confirmed"])))
-            T.append(TestCase(
-                test_id=nid(), journey_type="happy_path",
-                title=f"Full purchase journey: {prod}",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target="/checkout"),
-                       StepSpec(step=4, action="fill", role="textbox", name="Full name", value="Happy Buyer"),
-                       StepSpec(step=5, action="fill", role="textbox", name="Email", value="happy@qarena.dev"),
-                       StepSpec(step=6, action="fill", role="textbox", name="Street address", value="42 Green Rd"),
-                       StepSpec(step=7, action="click", role="button", name="Pay Now")],
-                expected=ExpectedContract(success_url_contains="/order",
-                                          text_required=["Order confirmed"],
-                                          money_non_negative=True)))
+        # every step here is conditional on the target ACTUALLY having that
+        # feature (route + control + pay button). "Cart is empty", "address is
+        # required" and "Order confirmed" are the app's own vocabulary; on an
+        # app that only has a cart (no checkout), demanding them filed bugs
+        # against features that do not exist.
+        pay_btn = self.named("button", ("pay", "place order", "submit order"))
+        if checkout_route and pay_btn:
+            cart_first_ok = self.has("button", "add to cart")
+            if cart_first_ok:
+                T.append(TestCase(
+                    test_id=nid(), journey_type="edge_case_negative",
+                    title="Checkout blocks empty cart",
+                    steps=[StepSpec(step=1, action="goto", target=checkout_route),
+                           StepSpec(step=2, action="click", role="button", name=pay_btn)],
+                    expected=ExpectedContract(should_reject=True,
+                                              text_forbidden=["Order confirmed"],
+                                              error_text="cart is empty")))
+                T.append(TestCase(
+                    test_id=nid(), journey_type="edge_case_negative",
+                    title="Checkout requires shipping address",
+                    steps=[StepSpec(step=1, action="goto", target="/"),
+                           StepSpec(step=2, action="click", role="button", name="Add to Cart"),
+                           StepSpec(step=3, action="goto", target=checkout_route),
+                           StepSpec(step=4, action="fill", role="textbox", name="Full name", value="No Addr"),
+                           StepSpec(step=5, action="fill", role="textbox", name="Email", value="noaddr@qarena.dev"),
+                           StepSpec(step=6, action="click", role="button", name=pay_btn)],
+                    expected=ExpectedContract(should_reject=True,
+                                              error_text="address is required",
+                                              text_forbidden=["Order confirmed"])))
+                T.append(TestCase(
+                    test_id=nid(), journey_type="happy_path",
+                    title=f"Full purchase journey: {prod}" if prod
+                          else "Full purchase journey",
+                    steps=[StepSpec(step=1, action="goto", target="/"),
+                           StepSpec(step=2, action="click", role="button", name="Add to Cart"),
+                           StepSpec(step=3, action="goto", target=checkout_route),
+                           StepSpec(step=4, action="fill", role="textbox", name="Full name", value="Happy Buyer"),
+                           StepSpec(step=5, action="fill", role="textbox", name="Email", value="happy@qarena.dev"),
+                           StepSpec(step=6, action="fill", role="textbox", name="Street address", value="42 Green Rd"),
+                           StepSpec(step=7, action="click", role="button", name=pay_btn)],
+                    # never invent the app's confirmation URL or success copy:
+                    # assert only the invariant that always holds (money stays
+                    # positive) plus the app's own requirement, when the caller
+                    # supplied one in the description
+                    expected=ExpectedContract(money_non_negative=True)))
 
         # --- dead-link patrol from exploration facts ---------------------------
-        # Only routes the target actually links to count. A 404 on a URL QArena
-        # guessed itself (cart/search enrichment probes) says nothing about the
-        # application and must never be filed as a defect.
+        # A failing destination is only a defect when the TARGET sent us there:
+        # the page must have been reached by following a real link the target
+        # published. A 404 on a URL QArena guessed (cart/checkout/search
+        # enrichment probes) says nothing about the application and is never
+        # patrolled — that was the synthetic-route false positive.
         dead = [s for s in self.map.states
-                if s.http_status >= 400 and not s.probed]
+                if s.http_status >= 400
+                and self.policy.provenance_of(s) in (provenance.SEED,
+                                                     provenance.LINK,
+                                                     provenance.INTERACTION)]
         for ds in dead[:2]:
-            link_name = ds.route.strip("/") or ds.route
-            # prefer a real link click when an accessible link exists in the
-            # element index — but icon-only/aria-less footers still deserve
-            # the patrol: navigate to the (proven dead) route directly
-            if self.has("link", link_name):
-                steps = [StepSpec(step=1, action="goto", target="/"),
+            src = self.policy.link_source(ds.route)
+            from_route = (src or {}).get("from_route") or "/"
+            label = (ds.link_name or (src or {}).get("link_name")
+                     or ds.route.strip("/") or ds.route)
+            if src and src.get("link_name"):
+                # reproduce it the way a user does: be on the page that shows
+                # the link, then follow it
+                steps = [StepSpec(step=1, action="goto", target=from_route),
                          StepSpec(step=2, action="click", role="link",
-                                  name=link_name.title().replace("-", " "))]
+                                  name=src["link_name"])]
             else:
-                steps = [StepSpec(step=1, action="goto", target="/"),
+                # link text unknown (icon-only/anchor without a name): the
+                # destination is still evidenced by the link the crawler found
+                steps = [StepSpec(step=1, action="goto", target=from_route),
                          StepSpec(step=2, action="goto", target=ds.route)]
             T.append(TestCase(
                 test_id=nid(), journey_type="happy_path",
-                title=f"{'Footer link' if steps[-1].action == 'click' else 'Route'} '{link_name}' serves a real page",
+                title=(f"Link '{label}' leads somewhere real"
+                       if steps[-1].action == "click"
+                       else f"Linked route '{label}' serves a real page"),
                 steps=steps,
                 expected=ExpectedContract(no_new_errors_5xx=True)))
         return T
 
     # --------------------------------------------- invented-step rejection
     def reject_invented(self, cases: list[TestCase]) -> tuple[list[TestCase], list[dict]]:
+        """Keep only journeys that run against routes the target really has.
+
+        Two distinct failures, both fatal to a journey:
+
+        * a route QArena only guessed (``policy.eligible`` is False) — this is
+          the synthetic-route guard: navigating there and finding a 404 proves
+          QArena's guess was wrong, not that the app is broken;
+        * a step naming a control the page does not actually have.
+
+        Every rejection records *why*, so the dashboard can show the reason
+        instead of a bare "invented".
+        """
         valid, rejected = [], []
-        routes = {"/"} | {s.route for s in self.map.states}
         for tc in cases:
-            ok, bad_steps = True, []
+            ok, bad_steps, why = True, [], ""
             route = "/"          # page reached by the most recent goto step
             for st in tc.steps:
                 if st.action == "goto":
-                    pat = re.sub(r"/\d+(?=/|$)", "/*", st.target)
-                    if st.target not in routes and pat not in routes:
+                    if not self.policy.eligible(st.target):
                         ok = False
-                        bad_steps.append(f"goto {st.target}")
+                        why = why or "synthetic_route"
+                        bad_steps.append(
+                            f"goto {st.target} — "
+                            f"{self.policy.why_not(st.target)}")
                     route = st.target
                 elif st.action in ("click", "fill", "select", "dblclick", "press"):
                     if not self.has(st.role, st.name):
                         ok = False
+                        why = why or "missing_control"
                         bad_steps.append(f'{st.action} {st.role} "{st.name}"')
                     elif st.action in ("click", "dblclick") and \
                             not self._on_route(route, st.role, st.name):
@@ -334,11 +451,15 @@ class Planner:
                         # element pair (clicking "Add to Cart" on a page that
                         # has no such button)
                         ok = False
+                        why = why or "wrong_page"
                         bad_steps.append(f'{st.action} {st.role} "{st.name}" '
                                          f"is not on {route}")
-            (valid if ok else rejected).append(
-                tc if ok else {"test_id": tc.test_id, "title": tc.title,
-                               "invented_steps": bad_steps})
+            if ok:
+                valid.append(tc)
+            else:
+                rejected.append({"test_id": tc.test_id, "title": tc.title,
+                                 "reason": why or "invented",
+                                 "invented_steps": bad_steps})
         return valid, rejected
 
     def _on_route(self, route: str, role: str, name: str) -> bool:
@@ -346,11 +467,13 @@ class Planner:
 
         Only answers when that page is actually mapped (otherwise the caller
         falls back to the global check) — a route we never mapped must not make
-        a step look invented.
+        a step look invented. Pages QArena merely guessed are never used as
+        evidence that a control exists.
         """
         pat = re.sub(r"/\d+(?=/|$)", "/*", route or "")
         state = next((s for s in self.map.states
-                      if s.route == pat or s.route == route), None)
+                      if (s.route == pat or s.route == route)
+                      and self.policy.confirmed(s.route)), None)
         if state is None or not state.elements:
             return True
         frag = self._norm(name)

@@ -21,19 +21,34 @@ from jinja2 import Environment, FileSystemLoader
 from . import config
 from .contracts import FiledBug, PossibleBug
 from .llm import LLMPolicy
+from .provenance import RoutePolicy
 
 SEVERITY_RANK = {"Critical": 3, "Major": 2, "Minor": 1}
 
 
 class Reporter:
-    def __init__(self, run_dir: Path, llm: LLMPolicy) -> None:
+    def __init__(self, run_dir: Path, llm: LLMPolicy, appmap=None) -> None:
         self.run_dir = run_dir
         self.llm = llm
+        # the AppMap lets the report separate a target-owned failure from a
+        # third-party request, a dead link the target itself published, and a
+        # URL QArena merely probed. Optional: reports degrade gracefully to
+        # host-level classification without it.
+        self.appmap = appmap
+        self.policy = RoutePolicy(appmap) if appmap is not None else None
+        # findings withheld because their evidence came from a synthetic route
+        self.suppressed: list[dict] = []
         self.jinja = Environment(
             loader=FileSystemLoader(str(config.JINJA_DIR)), autoescape=False)
 
     # ------------------------------------------------------- dedup + file
     def file_bugs(self, confirmed: list[tuple[PossibleBug, str]]) -> list[FiledBug]:
+        # FINAL SAFETY NET (third layer, after the planner and the verifier):
+        # never publish a finding whose evidence was taken on a route QArena
+        # invented. Each layer checks independently, so a future code path that
+        # skips one guard still cannot put an invented defect in the report.
+        blocked = {id(pb) for pb, _ in self.block_inadmissible(confirmed)}
+        confirmed = [c for c in confirmed if id(c[0]) not in blocked]
         merged: dict[tuple, dict] = {}
         for pb, repro in confirmed:
             ev = pb.evidence
@@ -121,16 +136,18 @@ class Reporter:
         return filed
 
     # ------------------------------------------------------- filing builder
-    @staticmethod
-    def _to_filed_bug(bug_id: str, pb: PossibleBug, repro: str, elem: str,
+    def _to_filed_bug(self, bug_id: str, pb: PossibleBug, repro: str, elem: str,
                       route: str, sev: str, score: float,
                       signals: list, title: str = "") -> FiledBug:
         """Assemble one report record from already-verified facts. Pure data —
         only the prose *title* is ever model-authored, and it is optional."""
         url = pb.evidence.url_after or pb.evidence.url_before or ""
-        expected, actual = Reporter._expect_actual(pb)
+        expected, actual, basis = Reporter._expect_actual(pb, self.policy)
+        http_lines = [f"{f.get('method', '?')} {f.get('url', '?')} "
+                      f"→ {f.get('status', '?')}"
+                      for f in pb.evidence.http_failures[:10]]
         return FiledBug(
-            bug_id=bug_id, title=title or Reporter._fallback_title(pb, elem, route),
+            bug_id=bug_id, title=title or self._fallback_title(pb, elem, route),
             severity=sev, journey=pb.journey,
             route=route, element_name=elem,
             signals=[h.signal for h in signals], score=score,
@@ -138,16 +155,24 @@ class Reporter:
             steps_to_reproduce=Reporter._human_steps(pb),
             expected_behavior=expected,
             actual_behavior=actual,
+            confidence_basis=(
+                f"weighted signal score {score} from signal(s) "
+                f"{', '.join(str(h.signal) for h in signals)}; "
+                f"reproduced {repro} in independent clean-browser replays"),
             evidence={"screenshot": pb.evidence.screenshot,
                       "trace": f"trace_{pb.test_id}.zip",
                       "url": url, "test_id": pb.test_id,
                       "confidence": score,
+                      "reproductions": repro,
+                      "affected_element": elem,
+                      "expected_source": basis,
+                      "why_it_matters": Reporter._why_it_matters(pb),
+                      # each failing request is classified, because a raw 404 is
+                      # evidence, not automatically a user-facing defect
+                      "network_analysis": self._classify_network(pb),
                       # raw console/network facts, so a reader can check the
                       # finding without opening the trace. Bounded on purpose.
-                      "http_failures": [
-                          f"{f.get('method', '?')} {f.get('url', '?')} "
-                          f"→ {f.get('status', '?')}"
-                          for f in pb.evidence.http_failures[:10]],
+                      "http_failures": http_lines,
                       "console_errors": [str(c)[:200]
                                          for c in pb.evidence.console_errors[:10]],
                       "signals": [f"S{h.signal} {h.name}: {h.evidence[:160]}"
@@ -160,6 +185,10 @@ class Reporter:
         must still reach the dashboard, with honest titles and no traceback.
         Reports are written when possible; failures are recorded, not raised.
         """
+        # the synthetic-route guard applies here too: a crashed reporting stage
+        # is not a licence to publish invented defects
+        blocked = {id(pb) for pb, _ in self.block_inadmissible(confirmed)}
+        confirmed = [c for c in confirmed if id(c[0]) not in blocked]
         filed: list[FiledBug] = []
         reports_dir = self.run_dir / "bug_reports"
         try:
@@ -294,9 +323,26 @@ class Reporter:
             return re.sub(r"\s+", " ", data["title"]).strip()[:140]
         return fallback
 
-    @staticmethod
-    def _fallback_title(pb: PossibleBug, elem: str, route: str) -> str:
+    def _fallback_title(self, pb: PossibleBug, elem: str, route: str) -> str:
+        """A factual one-line title, built from the evidence itself.
+
+        HTTP findings name the real request and (when the crawl graph knows it)
+        the link that leads there, because "GET /old-page → 404, linked as
+        'Old page' from /" is a fact a developer can act on, while
+        "route: http — 404" is not.
+        """
         s0 = max(pb.signals, key=lambda h: h.weight) if pb.signals else None
+        statuses = {f.get("status") for f in pb.evidence.http_failures}
+        if (pb.group or "").startswith("http:") and pb.evidence.http_failures:
+            f = pb.evidence.http_failures[0]
+            verb = f"{f.get('method', 'GET')} {f.get('url', route)}"
+            code = f.get("status", "?")
+            src = self.policy.link_source(route) if self.policy is not None else None
+            if src and src.get("link_name"):
+                return (f"Broken link \"{src['link_name']}\" on "
+                        f"{src.get('from_route') or '/'} — {verb} → {code}")[:140]
+            who = elem if elem and elem not in ("page", "/") else route
+            return f"{who}: {verb} → {code}"[:140]
         if not s0:
             return pb.journey
         ev = re.sub(r"\s+", " ", s0.evidence).strip()
@@ -323,8 +369,156 @@ class Reporter:
         return [f"{i}. {t}" for i, t in enumerate(out, 1)]
 
     @staticmethod
-    def _expect_actual(pb: PossibleBug) -> tuple[str, str]:
-        expected = ("The app follows its stated description: valid inputs are "
-                    "accepted, invalid inputs are rejected with a clear message, "
-                    "money values stay correct, and pages load without errors.")
-        return expected, f"{pb.summary} — observed during journey: {pb.journey}"
+    def _expect_actual(pb: PossibleBug, policy=None) -> tuple[str, str, str]:
+        """Expected behaviour, actual behaviour, and WHERE the expectation comes from.
+
+        QArena never invents a requirement. The expectation is built from, in
+        order of strength:
+
+        1. the target's own behaviour — a link the target publishes must lead
+           somewhere that loads;
+        2. the explicit test contract that was executed (``pb.oracle``);
+        3. otherwise the report says plainly that no explicit requirement was
+           supplied and judges only the observed behaviour.
+        """
+        actual = f"{pb.summary} — observed during journey: {pb.journey}"
+        contract = pb.oracle[0] if pb.oracle else {}
+        group = pb.group or ""
+        url = pb.evidence.url_after or pb.evidence.url_before or ""
+        route = Reporter._route_of(url)
+
+        # 1) target behaviour: this page is reachable from the target's own link
+        if group.startswith("http:"):
+            src = policy.link_source(route) if policy is not None else None
+            if src and (src.get("from_route") or src.get("link_name")):
+                via = (f"the link \"{src.get('link_name') or route}\" on "
+                       f"`{src.get('from_route') or '/'}`") if src.get("link_name") \
+                    else f"a link on `{src.get('from_route') or '/'}`"
+                return ("Following " + via + " should open a working page — the "
+                        "target itself advertises this destination.",
+                        actual,
+                        "observed target behaviour (the target publishes this link)")
+            return (f"`{route}` is part of the application and should load "
+                    f"without an HTTP error.",
+                    actual, "observed target behaviour (the page was reached through "
+                            "the application itself)")
+
+        # 2) the executed test contract
+        if contract:
+            if contract.get("should_reject"):
+                wanted = contract.get("error_text") or "a clear validation message"
+                return (f"Invalid input must be rejected with {wanted!r} — the test "
+                        f"contract executed for this journey.",
+                        actual, "the test contract for this journey (supplied rule)")
+            if contract.get("money_non_negative"):
+                return ("No monetary amount may ever be displayed as negative.",
+                        actual, "the test contract for this journey (supplied rule)")
+            if contract.get("badge_equals") is not None:
+                return (f"The cart badge must show {contract['badge_equals']} after "
+                        f"this action.",
+                        actual, "the test contract for this journey (supplied rule)")
+            req = contract.get("text_required") or []
+            if req:
+                return (f"The page must show {req} after this journey.",
+                        actual, "the test contract for this journey (supplied rule)")
+            if contract.get("text_forbidden"):
+                return (f"The page must not show "
+                        f"{contract.get('text_forbidden')} here.",
+                        actual, "the test contract for this journey (supplied rule)")
+
+        # 3) nothing to appeal to — say so instead of inventing a requirement
+        return ("No explicit requirement was supplied for this flow; the finding "
+                "is judged against the target's own observed behaviour and the "
+                "browser evidence below.",
+                actual, "no explicit requirement was supplied for this flow")
+
+    @staticmethod
+    def _why_it_matters(pb: PossibleBug) -> str:
+        """Explain the user impact of the evidence — never just restate it.
+
+        The HTTP statuses are read from the recorded failures rather than from
+        the signal's prose, so the sentence always matches the actual evidence.
+        """
+        sig = {h.signal for h in pb.signals}
+        g = pb.group or ""
+        statuses = {f.get("status") for f in pb.evidence.http_failures}
+        if g.startswith("http:") and any(
+                isinstance(s, int) and s >= 500 for s in statuses):
+            return ("A page the target serves or links to returns a server error, "
+                    "so a user following that path sees a failure page instead of "
+                    "content.")
+        if g.startswith("http:") and 404 in statuses:
+            return ("A page the target advertises is not served, so the user hits a "
+                    "dead end (broken navigation) instead of the promised page.")
+        if g.startswith("console:") or 1 in sig:
+            return ("A JavaScript error is raised in the browser, so part of the "
+                    "page's behaviour may silently not run for real users.")
+        if g.startswith("axe:") or 5 in sig:
+            return ("An accessibility violation means some users cannot perceive or "
+                    "operate this control (assistive-technology impact).")
+        if 4 in sig:
+            return ("Invalid input is accepted (or valid input rejected) without a "
+                    "clear message, so a user cannot tell what went wrong and bad "
+                    "data can enter the application.")
+        if 6 in sig:
+            return ("The page does not deliver the outcome the user's action "
+                    "promises, so the flow is broken from the user's point of view.")
+        if 3 in sig:
+            return ("The page renders broken content, so it does not present "
+                    "correctly to the user.")
+        return "The observed behaviour contradicts what the target itself promises."
+
+    def block_inadmissible(self, confirmed: list[tuple[PossibleBug, str]]) -> list:
+        """Findings whose evidence rests on a synthetic route — never published.
+
+        They are not silently deleted: each one is recorded in ``self.suppressed``
+        so the run can explain what was withheld and why.
+        """
+        if self.policy is None:
+            return []
+        out = []
+        for pb, repro in confirmed:
+            reason = self.policy.blocked_reason(pb.evidence.url_after
+                                                or pb.evidence.url_before)
+            if reason:
+                out.append((pb, repro))
+                self.suppressed.append({
+                    "journey": pb.journey, "test_id": pb.test_id,
+                    "group": pb.group, "summary": pb.summary[:200],
+                    "reason": reason, "reproduced": repro,
+                    "signals": [s.signal for s in pb.signals]})
+        return out
+
+    def _classify_network(self, pb: PossibleBug) -> list[dict]:
+        """Where did each failing request come from?
+
+        A 404 is evidence, not a verdict: a dead link the target published is the
+        target's fault, a third-party analytics beacon failing is not, and a URL
+        QArena guessed can never be filed at all.
+        """
+        out: list[dict] = []
+        for f in pb.evidence.http_failures[:10]:
+            url = str(f.get("url") or "")
+            status = f.get("status")
+            origin, note = "target", ""
+            if self.policy is not None:
+                origin = self.policy.network_origin(url)
+                blocked = self.policy.blocked_reason(url)
+                src = self.policy.link_source(url)
+                if blocked:
+                    origin, note = "synthetic probe", blocked
+                elif src and src.get("link_name"):
+                    origin = "dead link published by the target"
+                    note = (f"linked as \"{src['link_name']}\" from "
+                            f"`{src.get('from_route') or '/'}`")
+                elif src:
+                    origin = "link published by the target"
+                    note = f"linked from `{src.get('from_route') or '/'}`"
+                elif origin == "third_party":
+                    note = "third-party host — not owned by the target"
+                elif isinstance(status, int) and status >= 500:
+                    note = "server error on a target-owned resource"
+            elif self.appmap is None:
+                note = "origin not classified (no app map available for this report)"
+            out.append({"url": url, "status": status, "origin": origin, "note": note})
+        return out
