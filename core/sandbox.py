@@ -40,15 +40,56 @@ class Sandbox:
     @staticmethod
     def wait_until_responsive(url: str, timeout: int = 30) -> None:
         deadline = time.time() + timeout
+        attempts = 0
+        last_error = ""
         while time.time() < deadline:
+            attempts += 1
             try:
                 r = httpx.get(url, timeout=2)
                 if r.status_code < 600:
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                # keep the underlying cause: "never became responsive" alone
+                # cannot tell a DNS failure from a firewall dropping the
+                # connection, and the operator needs that difference
+                last_error = f"{exc.__class__.__name__}: {str(exc)[:180]}"
             time.sleep(0.5)
-        raise RuntimeError(f"target never became responsive: {url}")
+        raise RuntimeError(
+            f"target never became responsive: {url} — "
+            f"{Sandbox._unreachable_reason(last_error)}"
+            f" ({attempts} attempt(s) over {timeout}s"
+            + (f"; last error: {last_error}" if last_error else "") + ")")
+
+    @staticmethod
+    def _unreachable_reason(last_error: str) -> str:
+        """Plain-English classification of why a target could not be reached.
+
+        Deliberately conservative: it names the failure mode the transport
+        reported instead of guessing at the target's health.
+        """
+        if not last_error:
+            return ("no answer arrived at all (the host may be slow or the "
+                    "traffic is being dropped)")
+        low = last_error.lower()
+        if any(s in low for s in ("getaddrinfo", "gaierror",
+                                  "name or service not known",
+                                  "nodename nor servname",
+                                  "temporary failure in name resolution",
+                                  "no address associated")):
+            return ("the host name does not resolve here (DNS lookup failed) — "
+                    "check the spelling, and this environment's DNS rules")
+        if any(s in low for s in ("ssl", "tls", "wrong_version_number",
+                                  "certificate", "eof", "reset by peer",
+                                  "connection reset", "connection aborted")):
+            return ("the connection was closed during the TLS/HTTP handshake — "
+                    "a firewall, proxy or a restricted (sandboxed/CI) network "
+                    "that blocks this host looks exactly like this")
+        if "refused" in low:
+            return "nothing is listening there (connection refused)"
+        if "timed out" in low or "timeout" in low:
+            return ("the connection timed out — the target is slow, down, or "
+                    "being silently dropped by a firewall")
+        return "every request failed"
 
     def seed_target(self) -> bool:
         """QArena determinism hook: reset the world if the target offers /__seed__."""

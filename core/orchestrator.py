@@ -40,6 +40,7 @@ class RunHandle:
     run_dir: Path | None = None
     thread: threading.Thread | None = None
     current_stage: str = ""      # for diagnostics: names the stage in a traceback
+    seq: int = 0                 # monotonic event id: makes UI replays idempotent
 
 
 class Orchestrator:
@@ -71,6 +72,12 @@ class Orchestrator:
 
         def emit(e: dict) -> None:
             e["ts"] = round(time.time(), 2)
+            # every event carries a monotonic id. A live SSE client sees events
+            # streamed once, then gets the whole history replayed on any
+            # reconnect — without an id the UI showed the same event twice (two
+            # identical stage rows after the EventSource reconnected).
+            h.seq += 1
+            e["seq"] = h.seq
             h.history.append(e)
             h.events.put(e)
             try:
@@ -81,6 +88,14 @@ class Orchestrator:
             except Exception:
                 pass
         return emit
+
+    @staticmethod
+    def _push(h: RunHandle, e: dict) -> None:
+        """Queue-only event (terminal notices): streamed live, not replayed."""
+        e["ts"] = round(time.time(), 2)
+        h.seq += 1
+        e["seq"] = h.seq
+        h.events.put(e)
 
     def _guarded(self, h: RunHandle, res: RunResult, key: str, fn, emit):
         """Run one *non-fatal* stage. Late-stage failures must never erase
@@ -122,12 +137,13 @@ class Orchestrator:
                 h.result.status = "error"
                 h.result.error = (f"{h.current_stage}: {msg}"
                                   if h.current_stage else msg)
-            h.events.put({"type": "error", "msg": msg,
-                          "stage": h.current_stage})
+            self._push(h, {"type": "error", "msg": msg,
+                           "stage": h.current_stage})
         finally:
             self._save(h)
-            h.events.put({"type": "done", "status": h.result.status if h.result else "error",
-                          "result": self._result_json(h)})
+            self._push(h, {"type": "done",
+                           "status": h.result.status if h.result else "error",
+                           "result": self._result_json(h)})
 
     def _pipeline(self, h: RunHandle, url: str, desc: str,
                   email: str, password: str, whitebox: dict | None):

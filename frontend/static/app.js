@@ -67,6 +67,25 @@
   }
 
   // ---------------------------------------------------------------- events
+  const seenIds = new Set();
+  function deliver(ev) {
+    // The server stamps every event with a monotonic seq. A live client already
+    // rendered the streamed events, then receives the whole history again as a
+    // snapshot on every SSE reconnect — without this guard the same event was
+    // shown twice (two identical stage rows, duplicated field-log lines).
+    if (typeof ev.seq === "number") {
+      if (ev.seq <= (state.lastSeq || 0)) return;
+      state.lastSeq = ev.seq;
+      handle(ev);
+      return;
+    }
+    // runs recorded before seq existed: an event's identity is its timestamp +
+    // shape, and a replay carries the same values, so this stays exact
+    const key = [ev.type, ev.ts, ev.stage, ev.name, ev.msg].join("|");
+    if (seenIds.has(key)) return;
+    seenIds.add(key);
+    handle(ev);
+  }
   function handle(ev) {
     switch (ev.type) {
       case "stage":
@@ -308,7 +327,7 @@
     const ev = JSON.parse(m.data);
     if (ev.type === "snapshot") {
       if (state.done) { es.close(); return; }   // EventSource auto-reconnects
-      ev.history.forEach(handle);               // — replay must stay idempotent
+      (ev.history || []).forEach(deliver);      // — replay must stay idempotent
       if (ev.result && ev.result.status === "done") {
         onDone(ev.result);
         es.close();                             // a finished run never streams again
@@ -320,7 +339,7 @@
       return;
     }
     if (ev.type === "ping") return;
-    handle(ev);
+    deliver(ev);
   };
   es.onerror = () => { if (!state.done) log("…reconnecting to the field unit"); };
 })();

@@ -79,9 +79,12 @@
   <div class="card error-card" id="error-card" hidden>
     <h2 class="card-title">🛑 This expedition stopped early</h2>
     <p id="error-msg" class="explain"></p>
-    <p class="micro">Typical causes: the target URL is down, blocked by a firewall, or
-    took too long to answer. Fix the target, press “+ new expedition” and run again —
-    partial diagnostics stay available below.</p>
+    <p class="micro">The line above names the transport-level cause. Typical causes:
+    the target URL is down, blocked by a firewall, or took too long to answer — and a
+    sandboxed or CI environment whose outbound network access is restricted (a
+    whitelist, proxy or offline runner) fails in exactly the same way, so try a target
+    this machine can actually reach. Fix the target, press “+ new expedition” and run
+    again — partial diagnostics stay available below.</p>
   </div>
 
   <div class="card warn-card" id="partial-card" hidden>
