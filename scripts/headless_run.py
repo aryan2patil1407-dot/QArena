@@ -12,6 +12,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# event payloads carry "→" from signal evidence; a cp1252 console (Windows
+# PowerShell) cannot encode it and would crash the harness mid-run
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from core import config
 from core.orchestrator import Orchestrator, RunHandle
 
@@ -49,7 +57,7 @@ t0 = time.time()
 orch._safe_pipeline(h, URL, DESC, EMAIL, PWD, None)
 t.join(timeout=10)
 print(f"\n===== finished in {time.time()-t0:.0f}s =====")
-r = json.loads((h.run_dir / "results.json").read_text())
+r = json.loads((h.run_dir / "results.json").read_text(encoding="utf-8"))
 print("states:", r["states_found"], "cases:", r["tests_planned"],
       "passed:", r["tests_passed"], "steps:", r["steps_executed"])
 print("filed:", len(r["filed_bugs"]), "flaky:", len(r["flaky"]))

@@ -262,7 +262,11 @@ class Planner:
                                           money_non_negative=True)))
 
         # --- dead-link patrol from exploration facts ---------------------------
-        dead = [s for s in self.map.states if s.http_status >= 400]
+        # Only routes the target actually links to count. A 404 on a URL QArena
+        # guessed itself (cart/search enrichment probes) says nothing about the
+        # application and must never be filed as a defect.
+        dead = [s for s in self.map.states
+                if s.http_status >= 400 and not s.probed]
         for ds in dead[:2]:
             link_name = ds.route.strip("/") or ds.route
             # prefer a real link click when an accessible link exists in the

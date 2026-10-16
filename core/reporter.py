@@ -3,11 +3,17 @@ Stage 7a — Reporter Agent: dedup + severity + report generation.
 [Python Signature Match] merge duplicate bugs
 [Python Rules] deterministic severity      [LLM #4] title/summary prose ONLY
 [Jinja2 Template] fill report from saved factual data — never from model memory.
+
+Every file is written with an explicit ``encoding="utf-8"``. Relying on the
+platform default (cp1252 / "charmap" on Windows) aborts the whole stage the
+moment evidence contains a character outside the ANSI code page — signal
+evidence routinely does (``GET /cart → 404``).
 """
 from __future__ import annotations
 
 import json
 import re
+import traceback
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -90,26 +96,124 @@ class Reporter:
                 coalesced.values(), key=lambda x: -x["score"]), 1):
             bug_id = f"QA-{i:02d}"
             pb, repro = m["pb"], m["repro"]
-            title = self._title(pb, m["elem"], m["route"])
-            steps = self._human_steps(pb)
-            expected, actual = self._expect_actual(pb)
-            shot = pb.evidence.screenshot
-            trace = f"trace_{pb.test_id}.zip"
-            fb = FiledBug(
-                bug_id=bug_id, title=title, severity=m["sev"], journey=pb.journey,
-                route=m["route"], element_name=m["elem"],
-                signals=[h.signal for h in m["signals"]], score=m["score"],
-                reproduced_count=repro, steps_to_reproduce=steps,
-                expected_behavior=expected, actual_behavior=actual,
-                evidence={"screenshot": shot, "trace": trace,
-                          "signals": [f"S{h.signal} {h.name}: {h.evidence[:160]}"
-                                      for h in m["signals"]]})
-            md = self.jinja.get_template("bug_report.md.j2").render(bug=fb)
-            (reports_dir / f"{bug_id}.md").write_text(md)
+            fb = self._to_filed_bug(bug_id, pb, repro, m["elem"], m["route"],
+                                    m["sev"], m["score"], m["signals"],
+                                    title=self._title(pb, m["elem"], m["route"]))
+            # render + write the human report. A failure here must not cost us
+            # the filing itself: keep the FiledBug and say so in its evidence.
+            try:
+                md = self.jinja.get_template("bug_report.md.j2").render(bug=fb)
+                (reports_dir / f"{bug_id}.md").write_text(md, encoding="utf-8")
+                fb.evidence["report"] = f"bug_reports/{bug_id}.md"
+            except Exception as exc:
+                fb.evidence["warnings"] = list(fb.evidence.get("warnings", [])) + [
+                    f"markdown report could not be written "
+                    f"({exc.__class__.__name__}: {exc}) — filing kept, facts above "
+                    f"are unchanged"]
+                self._log_warning(bug_id, exc)
             filed.append(fb)
         (self.run_dir / "bugs_filed.json").write_text(
-            json.dumps([b.model_dump() for b in filed], indent=2))
+            json.dumps([b.model_dump() for b in filed], indent=2),
+            encoding="utf-8")
         return filed
+
+    # ------------------------------------------------------- filing builder
+    @staticmethod
+    def _to_filed_bug(bug_id: str, pb: PossibleBug, repro: str, elem: str,
+                      route: str, sev: str, score: float,
+                      signals: list, title: str = "") -> FiledBug:
+        """Assemble one report record from already-verified facts. Pure data —
+        only the prose *title* is ever model-authored, and it is optional."""
+        url = pb.evidence.url_after or pb.evidence.url_before or ""
+        expected, actual = Reporter._expect_actual(pb)
+        return FiledBug(
+            bug_id=bug_id, title=title or Reporter._fallback_title(pb, elem, route),
+            severity=sev, journey=pb.journey,
+            route=route, element_name=elem,
+            signals=[h.signal for h in signals], score=score,
+            reproduced_count=repro,
+            steps_to_reproduce=Reporter._human_steps(pb),
+            expected_behavior=expected,
+            actual_behavior=actual,
+            evidence={"screenshot": pb.evidence.screenshot,
+                      "trace": f"trace_{pb.test_id}.zip",
+                      "url": url, "test_id": pb.test_id,
+                      "confidence": score,
+                      "signals": [f"S{h.signal} {h.name}: {h.evidence[:160]}"
+                                  for h in signals]})
+
+    def fallback_file_bugs(self, confirmed: list[tuple[PossibleBug, str]]) -> list[FiledBug]:
+        """Last-resort filing used when the reporting stage dies as a whole.
+
+        Verified findings are already proved (>=2/3 clean-browser replays) — they
+        must still reach the dashboard, with honest titles and no traceback.
+        Reports are written when possible; failures are recorded, not raised.
+        """
+        filed: list[FiledBug] = []
+        reports_dir = self.run_dir / "bug_reports"
+        try:
+            reports_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+        def safely(fn, default):
+            """The fallback must not depend on the code that just failed."""
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        for i, (pb, repro) in enumerate(confirmed, 1):
+            bug_id = f"QA-{i:02d}"
+            route = safely(lambda: self._route_of(
+                pb.evidence.url_after or pb.evidence.url_before), "")
+            elem = safely(lambda: self._element_of(pb), "page")
+            sev = safely(lambda: self._severity(pb), "Major")
+            try:
+                fb = self._to_filed_bug(bug_id, pb, repro, elem, route,
+                                        sev, pb.score, pb.signals)
+            except Exception:
+                # absolute last resort: keep the verified finding, plainest form
+                fb = FiledBug(
+                    bug_id=bug_id, title=pb.journey or bug_id, severity=sev,
+                    journey=pb.journey, route=route, element_name=elem,
+                    signals=[h.signal for h in pb.signals], score=pb.score,
+                    reproduced_count=repro,
+                    steps_to_reproduce=[], expected_behavior="",
+                    actual_behavior=pb.summary,
+                    evidence={"screenshot": pb.evidence.screenshot,
+                              "signals": [h.evidence[:160] for h in pb.signals]})
+            fb.evidence["warnings"] = list(fb.evidence.get("warnings", [])) + [
+                "reported through the fallback filer because the reporting stage "
+                "failed — evidence above is unchanged, prose is not LLM-written"]
+            try:
+                md = self.jinja.get_template("bug_report.md.j2").render(bug=fb)
+                (reports_dir / f"{bug_id}.md").write_text(md, encoding="utf-8")
+                fb.evidence["report"] = f"bug_reports/{bug_id}.md"
+            except Exception as exc:
+                fb.evidence["warnings"].append(
+                    f"markdown report could not be written "
+                    f"({exc.__class__.__name__}: {exc})")
+            filed.append(fb)
+        try:
+            (self.run_dir / "bugs_filed.json").write_text(
+                json.dumps([b.model_dump() for b in filed], indent=2),
+                encoding="utf-8")
+        except Exception:
+            pass
+        return filed
+
+    def _log_warning(self, bug_id: str, exc: Exception) -> None:
+        """Diagnostics go to a UTF-8 file with a traceback — never to stdout with
+        the platform default encoding."""
+        try:
+            with open(self.run_dir / "run.log", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "type": "warning", "stage": "reporter", "bug_id": bug_id,
+                    "msg": f"{exc.__class__.__name__}: {exc}",
+                    "traceback": traceback.format_exc()}) + "\n")
+        except Exception:
+            pass
+
 
     # ------------------------------------------------------------ severity
     @staticmethod

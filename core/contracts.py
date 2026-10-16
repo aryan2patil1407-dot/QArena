@@ -27,6 +27,10 @@ class AppState(BaseModel):
     state_hash: str
     http_status: int = 200
     elements: list[StateElement] = Field(default_factory=list)
+    # provenance: True when QArena *guessed* the URL (enrichment/search probe)
+    # instead of reaching it through a real link on the target. A probed route
+    # 404ing is NOT an application defect — never report it as one.
+    probed: bool = False
 
 
 class AppMap(BaseModel):
@@ -150,4 +154,8 @@ class RunResult(BaseModel):
     rejected_steps: list[dict] = Field(default_factory=list)
     coverage: dict = Field(default_factory=dict)
     benchmark: dict = Field(default_factory=dict)
+    # non-fatal stage failures, e.g. {"reporter": "UnicodeEncodeError: ..."}.
+    # Populated when a late stage fails after verified findings already exist;
+    # the run is then reported as "partial" rather than thrown away.
+    stage_errors: dict[str, str] = Field(default_factory=dict)
     error: str = ""

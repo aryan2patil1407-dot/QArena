@@ -84,6 +84,16 @@
     partial diagnostics stay available below.</p>
   </div>
 
+  <div class="card warn-card" id="partial-card" hidden>
+    <h2 class="card-title">⚠️ Finished with warnings — findings below are real</h2>
+    <p class="explain">The hunt completed and every bug listed here was still proven
+    by replay. One or more <em>later</em> stages failed, so part of the handover is
+    incomplete. Nothing proven was discarded.</p>
+    <ul id="partial-list" class="mono"></ul>
+    <p class="micro">Diagnostics for each failure (full stack traces) are in
+    <code>run.log</code> inside the evidence pack.</p>
+  </div>
+
   <div class="card bench-card" id="bench-card" hidden>
     <h2 class="card-title">Benchmark vs planted-bug ground truth <span class="stamp">STAGE 8</span></h2>
     <p class="micro">Only shown when the run dir ships a ground-truth bug list

@@ -26,7 +26,7 @@ class Tester:
         self.sbx = sandbox
         self.map = appmap
         self.run_dir = run_dir
-        self.axe_src = config.AXE_JS.read_text()
+        self.axe_src = config.AXE_JS.read_text(encoding="utf-8")
         self.axe_injected: dict[int, bool] = {}  # per-page axe injection guard
         self.emit = emit
         self.link_status: dict[str, int] = {
@@ -50,7 +50,7 @@ class Tester:
                     if loc.get("url") else ""
             except Exception:
                 path = ""
-            console_errors.append(m.text + path)
+            console_errors.append((m.text or "") + path)
 
         page.on("console", _console)
         page.on("pageerror", lambda e: console_errors.append("[uncaught] " + str(e)))

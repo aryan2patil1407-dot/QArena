@@ -28,6 +28,7 @@ class LLMPolicy:
         self.calls: list[str] = []
         self.tokens_prompt = 0
         self.tokens_completion = 0
+        self.failures = 0          # call sites that fell back to heuristics
         self.model = os.environ.get("QARENA_LLM_MODEL", config.LLM_MODEL_ENV_DEFAULT)
 
     @property
@@ -35,6 +36,27 @@ class LLMPolicy:
         if os.environ.get("QARENA_OFFLINE", "").lower() in ("1", "true"):
             return False
         return any(os.environ.get(k) for k in KEY_ENV_NAMES)
+
+    @property
+    def status(self) -> str:
+        """Human-readable truth about the AI layer, used for the run's llm_mode.
+
+        A key being present is not the same as calls succeeding — a missing
+        ``litellm`` or a provider error silently falls back to heuristics, and
+        the run must say so instead of advertising "litellm".
+        """
+        if os.environ.get("QARENA_OFFLINE", "").lower() in ("1", "true"):
+            return "heuristic (key-free — QARENA_OFFLINE=1)"
+        if not any(os.environ.get(k) for k in KEY_ENV_NAMES):
+            return "heuristic (key-free)"
+        try:
+            import litellm  # noqa: F401
+        except ImportError:
+            return (f"heuristic (key present but litellm is not installed — "
+                    f"pip install litellm to enable hybrid mode)")
+        if self.failures:
+            return f"litellm ({self.failures} call site(s) fell back to heuristics)"
+        return "litellm"
 
     @property
     def total_tokens(self) -> int:
@@ -61,7 +83,9 @@ class LLMPolicy:
             text = resp.choices[0].message.content or ""
             return parse_json_loose(text)
         except Exception as exc:  # provider down / quota / bad key → fallback, never crash
-            print(f"[llm] {site} failed: {exc.__class__.__name__}")
+            self.failures += 1
+            # ASCII-only: this may hit a console on a non-UTF-8 code page
+            print(f"[llm] {site} failed ({exc.__class__.__name__}) - using heuristics")
             return None
 
 

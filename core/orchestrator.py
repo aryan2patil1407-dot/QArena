@@ -12,6 +12,7 @@ import queue
 import shutil
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,7 @@ class RunHandle:
     result: RunResult | None = None
     run_dir: Path | None = None
     thread: threading.Thread | None = None
+    current_stage: str = ""      # for diagnostics: names the stage in a traceback
 
 
 class Orchestrator:
@@ -72,11 +74,39 @@ class Orchestrator:
             h.history.append(e)
             h.events.put(e)
             try:
-                with open(h.run_dir / "run.log", "a") as fh:
+                # explicit UTF-8: event payloads carry "→" from signal evidence
+                # and would abort on the platform default code page (Windows).
+                with open(h.run_dir / "run.log", "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(e) + "\n")
             except Exception:
                 pass
         return emit
+
+    def _guarded(self, h: RunHandle, res: RunResult, key: str, fn, emit):
+        """Run one *non-fatal* stage. Late-stage failures must never erase
+        findings that earlier stages already verified: record the error, log the
+        traceback, tell the UI, and carry on with a ``None`` result."""
+        try:
+            return fn()
+        except Exception as exc:
+            ctx = f"{h.current_stage}: " if h.current_stage else ""
+            res.stage_errors[key] = f"{ctx}{exc.__class__.__name__}: {exc}"
+            self._log_traceback(h, key)
+            emit({"type": "warning", "stage": key,
+                  "msg": f"{key} stage failed ({exc.__class__.__name__}: {exc})"
+                         f" — verified findings from earlier stages are kept"})
+            return None
+
+    def _log_traceback(self, h: RunHandle, stage_key: str) -> None:
+        """Full stack trace into the run's own log — bounded to the run dir and
+        never echoed to a console that may not encode it."""
+        try:
+            with open(h.run_dir / "run.log", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "traceback", "stage": stage_key,
+                                     "ts": round(time.time(), 2),
+                                     "msg": traceback.format_exc()}) + "\n")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- pipeline
     def _safe_pipeline(self, h: RunHandle, url: str, desc: str,
@@ -84,10 +114,16 @@ class Orchestrator:
         try:
             self._pipeline(h, url, desc, email, password, whitebox)
         except Exception as exc:
-            h.events.put({"type": "error", "msg": f"{exc.__class__.__name__}: {exc}"})
+            # fatal: name the stage, keep the stack trace, and do NOT discard
+            # whatever the earlier stages already verified and persisted.
+            self._log_traceback(h, h.current_stage or "pipeline")
+            msg = f"{exc.__class__.__name__}: {exc}"
             if h.result:
                 h.result.status = "error"
-                h.result.error = str(exc)
+                h.result.error = (f"{h.current_stage}: {msg}"
+                                  if h.current_stage else msg)
+            h.events.put({"type": "error", "msg": msg,
+                          "stage": h.current_stage})
         finally:
             self._save(h)
             h.events.put({"type": "done", "status": h.result.status if h.result else "error",
@@ -99,10 +135,14 @@ class Orchestrator:
         sbx = Sandbox(url, h.run_dir)
         emit = self.emit_of(h.run_id)
         res = h.result
-        res.llm_mode = "litellm" if llm.available else "heuristic (key-free)"
+        res.llm_mode = llm.status
 
         def stage(n: int, name: str):
+            h.current_stage = f"stage {n} ({name.split(' — ')[0].strip()})"
             emit({"type": "stage", "stage": n, "name": name})
+
+        def guarded(key: str, fn):
+            return self._guarded(h, res, key, fn, emit)
 
         try:
             # ------------------------------- STAGE 2: sandbox + safety + login
@@ -211,31 +251,70 @@ class Orchestrator:
                         journey=f"{pb.journey} [{pb.group}]", summary=pb.summary[:200],
                         reproduced=count, signals=[s.signal for s in pb.signals]))
                     emit({"type": "flaky", "journey": pb.journey, "count": count})
+                # incremental safekeeping: each proof lands on disk as it is made,
+                # so even a crash inside the replay loop cannot lose it
+                self._persist_confirmed(h, confirmed)
                 self._save(h)
+
+            # verified findings hit disk BEFORE any late stage can fail, so a
+            # crash in reporting/export/benchmark can never erase them
+            self._persist_confirmed(h, confirmed)
 
             # ------------------------------- STAGE 7a: dedup + reports
             stage(7, "Reporter — dedup, severity, human-quality reports")
             reporter = Reporter(h.run_dir, llm)
-            res.filed_bugs = reporter.file_bugs(confirmed)
+            filed = guarded("reporter", lambda: reporter.file_bugs(confirmed))
+            if filed is None:
+                # reporting died as a whole: still surface the proven findings
+                # through the fallback filer (facts unchanged, prose canonical)
+                filed = reporter.fallback_file_bugs(confirmed)
+            res.filed_bugs = filed
+            self._save(h)
 
             # ------------------------------- STAGE 7b: export + self-verify
             stage(7, "Exporter — pytest suite, self-verified green")
             exporter = Exporter(h.run_dir, url)
-            files = exporter.export(passed_cases)
-            keep, pytest_log = exporter.self_verify(files)
-            (h.run_dir / "pytest_self_run.log").write_text(pytest_log)
-            res.exported_tests = keep
+
+            def _export() -> list[str]:
+                files = exporter.export(passed_cases)
+                keep, pytest_log = exporter.self_verify(files)
+                (h.run_dir / "pytest_self_run.log").write_text(
+                    pytest_log, encoding="utf-8")
+                return keep
+
+            keep = guarded("exporter", _export)
+            res.exported_tests = keep if keep is not None else []
             res.tests_passed = len(passed_cases)
             res.coverage = self._coverage(appmap, cases, passed_cases)
 
             # ------------------------------- STAGE 8: benchmark
             stage(8, "Benchmark — precision / recall / F1 vs ground truth")
             from scorer.evaluate_benchmark import evaluate
-            res.benchmark = evaluate(h.run_dir)
+            bench = guarded("benchmark", lambda: evaluate(h.run_dir))
+            res.benchmark = (bench if bench is not None
+                             else {"available": False,
+                                   "error": res.stage_errors.get("benchmark", "")})
             res.tokens_used = llm.total_tokens
-            res.status = "done"
+            res.llm_mode = llm.status      # failures during the run are admitted here
+            # honest terminal status: everything ran => "done"; a late stage
+            # failed but the core pipeline (and its verified findings) survived
+            # => "partial"
+            res.status = "partial" if res.stage_errors else "done"
         finally:
             sbx.shutdown()
+
+    @staticmethod
+    def _persist_confirmed(h: RunHandle,
+                           confirmed: list[tuple[PossibleBug, str]]) -> None:
+        """Write replay-verified findings to their own artifact immediately."""
+        try:
+            payload = [{"possible_bug": pb.model_dump(), "reproduced_count": count}
+                       for pb, count in confirmed]
+            (h.run_dir / "confirmed.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            # best-effort safekeeping; the authoritative filing path is Stage 7a
+            pass
 
     # ---------------------------------------------------------------- misc
     @staticmethod
@@ -298,8 +377,10 @@ class Orchestrator:
 
     def _save(self, h: RunHandle) -> None:
         if h.result and h.run_dir:
+            # UTF-8 explicitly: pydantic does not escape non-ASCII, so signal
+            # evidence ("→ 404") reaches this file verbatim
             (h.run_dir / "results.json").write_text(
-                h.result.model_dump_json(indent=2))
+                h.result.model_dump_json(indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------- utilities
     def latest_run(self) -> RunHandle | None:

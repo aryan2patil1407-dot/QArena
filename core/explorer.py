@@ -68,6 +68,7 @@ class Explorer:
         self._seen_hash: dict[str, str] = {}   # state_hash -> state_id
         self._visited_urls: set[str] = set()
         self._link_status: dict[str, int] = {}
+        self._probed_urls: set[str] = set()    # QArena-synthesised URLs
 
     # ---------------------------------------------------------------- main
     def explore(self, description: str) -> AppMap:
@@ -90,7 +91,8 @@ class Explorer:
             if url in self._visited_urls or not self._in_scope(url):
                 continue
             self._visited_urls.add(url)
-            state, links, has_search = self._visit(page, url)
+            state, links, has_search = self._visit(
+                page, url, probed=url in self._probed_urls)
             actions += 1
             if state is None:
                 continue
@@ -107,6 +109,8 @@ class Explorer:
             if has_search:
                 probe = self.sbx.target_url + "/search?q=" + config.SEARCH_PROBE
                 if self._in_scope(probe) and probe not in self._visited_urls:
+                    # QArena-synthesised URL => probed, never a reportable route
+                    self._probed_urls.add(probe)
                     frontier.append((probe, depth + 1))
                     self.appmap.edges.append(
                         {"from": state.state_id, "to": "/search",
@@ -149,14 +153,17 @@ class Explorer:
             if btn.count():
                 btn.first.click()
                 page.wait_for_timeout(600)
-            self._visit(page, self.sbx.target_url + "/cart")
-            self._visit(page, self.sbx.target_url + "/checkout")
+            # probed=True: these URLs are QArena's guesses, not links found on
+            # the target. If one 404s that is NOT an application defect, so the
+            # planner must never raise a dead-route report for them.
+            self._visit(page, self.sbx.target_url + "/cart", probed=True)
+            self._visit(page, self.sbx.target_url + "/checkout", probed=True)
             ctx.close()
         except Exception:
             pass
 
     # ------------------------------------------------------------- visit one
-    def _visit(self, page, url: str):
+    def _visit(self, page, url: str, probed: bool = False):
         try:
             resp = page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(350)
@@ -179,7 +186,7 @@ class Explorer:
 
         state = AppState(
             state_id=state_id, route=route,
-            url=page.url, state_hash=shash, http_status=status,
+            url=page.url, state_hash=shash, http_status=status, probed=probed,
             elements=[StateElement(id=f"{state_id}e{i}", role=e["role"],
                                    name=e["name"])
                       for i, e in enumerate(elements)])
@@ -228,7 +235,8 @@ class Explorer:
 
     # ------------------------------------------------------------- persist
     def _persist(self) -> None:
-        (self.run_dir / "AppMap.json").write_text(self.appmap.model_dump_json(indent=2))
+        (self.run_dir / "AppMap.json").write_text(
+            self.appmap.model_dump_json(indent=2), encoding="utf-8")
         db = sqlite3.connect(self.run_dir / "codemap.sqlite")
         db.executescript(
             "CREATE TABLE IF NOT EXISTS states(state_id TEXT PRIMARY KEY, data TEXT);"
@@ -262,4 +270,5 @@ class Explorer:
             net.write_html(str(self.run_dir / "map.html"), notebook=False)
         except Exception as exc:
             (self.run_dir / "map.html").write_text(
-                f"<html><body>map render failed: {exc}</body></html>")
+                f"<html><body>map render failed: {exc}</body></html>",
+                encoding="utf-8")

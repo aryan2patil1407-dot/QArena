@@ -39,6 +39,8 @@ a{color:var(--forest)}
 #status-pill.RUNNING{background:var(--amber);color:#fff;border-color:var(--amber)}
 #status-pill.done{background:var(--forest);color:#fff;border-color:var(--forest)}
 #status-pill.error{background:var(--brick);color:#fff;border-color:var(--brick)}
+/* finished, but a late stage (reporting/export/benchmark) failed */
+#status-pill.partial{background:var(--amber);color:#fff;border-color:var(--amber)}
 .stamp{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--muted);
   border:1px solid var(--muted);border-radius:3px;padding:2px 7px;
   transform:rotate(-2deg);display:inline-block;background:var(--paper)}
@@ -202,6 +204,9 @@ a{color:var(--forest)}
 .code-block{background:var(--paper);border:1px solid var(--line);border-radius:6px;
   padding:12px 14px;font-size:12.5px;line-height:1.7;overflow-x:auto}
 .error-card{border-color:var(--brick);background:#fdeceb}
+.warn-card{border-color:var(--amber);background:#fdf6e6}
+.warn-card ul{margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.65}
+#log li.warn-ev{color:var(--amber)}
 .clean-card{border-color:var(--forest);background:#eef6ef}
 
 /* ---------- accessibility ---------- */

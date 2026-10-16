@@ -131,6 +131,9 @@
           : `Journey ${ev.test}: broke a promised rule — looking for solid proof…`,
           ev.verdict === "passed" ? "ok" : "");
         break;
+      case "warning":
+        log(`⚠ ${ev.msg}`, "warn-ev");
+        break;
       case "error":
         log(`STOPPED: ${ev.msg}`, "bug");
         break;
@@ -155,13 +158,20 @@
       li.classList.add("done");
     });
     const pill = $("status-pill");
-    pill.textContent = (result && result.status === "error") ? "STOPPED EARLY" : "COMPLETE";
-    pill.className = "pill mono " + (result && result.status === "error" ? "error" : "done");
+    const status = result && result.status;
+    // "partial" is a real outcome: the hunt finished and proved findings, but a
+    // later stage failed. Say that, rather than "COMPLETE" or "STOPPED EARLY".
+    pill.textContent = status === "error" ? "STOPPED EARLY"
+                     : status === "partial" ? "DONE — WITH WARNINGS"
+                     : "COMPLETE";
+    pill.className = "pill mono " + (status === "error" ? "error"
+                                   : status === "partial" ? "partial" : "done");
     $("zip-btn").hidden = false;
     $("findings").hidden = false;
     const res = result || (await fetch(`/api/runs/${runId}/result`).then((r) => r.json()));
     // pin KPI tiles to results.json — history replay is a retelling, not accounting
     $("st-confirmed").textContent = (res.filed_bugs || []).length;
+    $("st-flaky").textContent = (res.flaky || []).length;
     if (res.steps_executed != null) $("st-steps").textContent = res.steps_executed;
     if (res.states_found != null) $("st-states").textContent = res.states_found;
     if (res.tests_planned != null) $("st-tests").textContent = res.tests_planned;
@@ -175,6 +185,14 @@
     if (res.status === "error" && res.error) {
       $("error-card").hidden = false;
       $("error-msg").textContent = res.error;
+    }
+    const stageErrors = res.stage_errors || {};
+    const failedStages = Object.keys(stageErrors);
+    if (failedStages.length) {
+      $("partial-card").hidden = false;
+      $("partial-list").innerHTML = failedStages
+        .map((k) => `<li><b>${esc(k)}</b> stage failed — ${esc(stageErrors[k])}</li>`)
+        .join("");
     }
     if (res.benchmark && res.benchmark.available) {
       const b = res.benchmark;

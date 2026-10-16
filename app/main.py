@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -22,6 +23,16 @@ from core import config
 from core.orchestrator import Orchestrator
 
 ROOT = config.ROOT
+
+# Console safety (Windows PowerShell / any non-UTF-8 code page): event payloads
+# and exception messages contain evidence characters such as "→". A console that
+# cannot encode them would raise *while reporting an error*, hiding the original
+# failure. Files are always written as UTF-8; the console is best-effort only.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:
+        pass
 app = FastAPI(title="QArena — Autonomous AI QA Engineer", docs_url=None)
 app.mount("/static", StaticFiles(directory=ROOT / "frontend" / "static"),
           name="static")
@@ -44,11 +55,27 @@ def load_handle(run_id: str):
         return None
     h = RunHandle(run_id=run_id)
     h.run_dir = run_dir
-    h.result = RunResult(**json.loads(results.read_text()))
+    # artifacts are always written as UTF-8 (evidence carries "→", "—", …)
+    h.result = RunResult(**json.loads(results.read_text(encoding="utf-8")))
+    if h.result.status == "running":
+        # Nothing is executing this run any more — the process that owned it
+        # restarted. Stop advertising it as live (this also unblocks the
+        # concurrent-run guard, which would otherwise refuse every new
+        # expedition until the UI server was restarted).
+        h.result.status = "error"
+        h.result.error = (h.result.error or
+                          "run was interrupted (the UI server restarted before "
+                          "the pipeline finished) — artifacts up to the last "
+                          "completed step are preserved")
+        try:
+            (run_dir / "results.json").write_text(
+                h.result.model_dump_json(indent=2), encoding="utf-8")
+        except Exception:
+            pass
     log = run_dir / "run.log"
     if log.exists():
-        h.history = [json.loads(ln) for ln in log.read_text().splitlines()
-                     if ln.strip()]
+        h.history = [json.loads(ln) for ln in
+                     log.read_text(encoding="utf-8").splitlines() if ln.strip()]
     orch.runs[run_id] = h
     return h
 
@@ -100,7 +127,9 @@ async def api_start(request: Request):
                                  "characters — business rules, not essays)")
     if len(body.get("email") or "") > 320 or len(body.get("password") or "") > 320:
         raise HTTPException(400, "credential fields are too long")
-    if any(h.result and h.result.status == "running" for h in orch.runs.values()):
+    # a live *thread* is the only real evidence of a concurrent run: a handle
+    # resurrected from disk has no thread and must never block new expeditions
+    if any(h.thread and h.thread.is_alive() for h in orch.runs.values()):
         raise HTTPException(409, "an expedition is already running — start the "
                                  "next one when it finishes")
     run_id = orch.start_run(
@@ -149,7 +178,7 @@ async def api_bugs(run_id: str):
     p = config.ARTIFACTS / f"run_{run_id}" / "bugs_filed.json"
     if not p.exists():
         return JSONResponse([])
-    return JSONResponse(json.loads(p.read_text()))
+    return JSONResponse(json.loads(p.read_text(encoding="utf-8")))
 
 
 @app.get("/artifacts/{run_id}/{path:path}")
@@ -168,7 +197,9 @@ async def api_zip(run_id: str):
     if not h or not h.run_dir:
         raise HTTPException(404, "unknown run")
     archive = Path(str(h.run_dir) + ".zip")
-    done = h.result is not None and h.result.status in ("done", "error")
+    # terminal states: a "partial" run is finished too (a late stage failed,
+    # the evidence pack is still complete for what did run)
+    done = h.result is not None and h.result.status in ("done", "partial", "error")
     # finished runs: build the evidence pack ONCE, then serve the cached file;
     # running runs: always re-zip (fresh data) — never block the event loop
     if done and archive.exists():

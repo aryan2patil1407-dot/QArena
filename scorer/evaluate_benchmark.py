@@ -44,8 +44,8 @@ def evaluate(run_dir: Path, bugs_path: Path | None = None,
     filed_path = Path(run_dir) / "bugs_filed.json"
     if not bugs_path.exists() or not filed_path.exists():
         return {"available": False}
-    truth = json.loads(bugs_path.read_text())["bugs"]
-    filed = json.loads(filed_path.read_text())
+    truth = json.loads(bugs_path.read_text(encoding="utf-8"))["bugs"]
+    filed = json.loads(filed_path.read_text(encoding="utf-8"))
 
     tp_hits, used_truth = [], set()
     for f in filed:

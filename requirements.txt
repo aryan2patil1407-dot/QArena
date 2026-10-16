@@ -10,6 +10,10 @@ playwright>=1.44          # browser engine for explorer/tester/verifier (pass^3 
 pyvis>=0.3                # interactive territory-map renderer (AppMap)
 pydantic>=2               # Stage-4/5 contracts (TestCase, PossibleBug, RunResult…)
 pytest>=8                 # exported suite runner (self-verified green)
+# required to actually EXECUTE the exported suite: provides the `page` fixture
+# and the `--base-url` flag used by Stage 7b's self-verification (pulls in
+# pytest-base-url). Without it every exported test is dropped as unverified.
+pytest-playwright>=0.5    # exported suite: `page` fixture + --base-url
 # LLM is optional: QArena runs fully key-free (heuristic mode). Set an API key
 # and the 4-call hybrid planner/judge/reporter upgrade kicks in automatically.
 python-dotenv>=1
