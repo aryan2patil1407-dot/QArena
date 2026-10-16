@@ -1,7 +1,13 @@
 # {{ bug.bug_id }} — {{ bug.title }}
 
 **Severity:** {{ bug.severity }}   **Status:** Confirmed (reproduced {{ bug.reproduced_count }} in clean-browser replay)
-**Journey:** `{{ bug.journey }}`   **Route:** `{{ bug.route }}`   **Signals:** {{ bug.signals | map('string') | join(', ') }}
+**Journey:** `{{ bug.journey }}`   **Test:** `{{ bug.evidence.get('test_id', '—') }}`   **Route:** `{{ bug.route }}`   **Signals:** {{ bug.signals | map('string') | join(', ') }}
+{% if bug.evidence.get('url') -%}
+**URL at failure:** `{{ bug.evidence.get('url') }}`
+{% endif -%}
+{% if bug.evidence.get('confidence') is not none -%}
+**Confidence:** {{ bug.evidence.get('confidence') }} (weighted signal score)
+{% endif %}
 
 ## Steps to reproduce
 {% for step in bug.steps_to_reproduce -%}
@@ -14,12 +20,32 @@
 ## Actual behaviour
 {{ bug.actual_behavior }}
 
+## Console & network evidence
+{% set net = bug.evidence.get('http_failures') or [] -%}
+{% set con = bug.evidence.get('console_errors') or [] -%}
+{% for f in net -%}
+- Network: {{ f }}
+{% endfor -%}
+{% for c in con -%}
+- Console: {{ c }}
+{% endfor -%}
+{% if not net and not con -%}
+- No console or network errors were captured for this finding — the defect is of
+  another kind (form, intent, accessibility), or the browser logged nothing.
+{% endif %}
+
 ## Evidence
 {% for s in bug.evidence.get('signals', []) -%}
 - {{ s }}
-{% endfor %}
+{% endfor -%}
 - Screenshot: `{{ bug.evidence.get('screenshot', '') }}`
 - Full Playwright trace: `{{ bug.evidence.get('trace', '') }}`
+{% if bug.evidence.get('report') -%}
+- This report: `{{ bug.evidence.get('report') }}`
+{% endif -%}
+{% for w in bug.evidence.get('warnings', []) -%}
+- ⚠ {{ w }}
+{% endfor %}
 
 ---
 *Filed by QArena — every fact above is replay-verified in a clean browser (zero AI in the verification loop).*

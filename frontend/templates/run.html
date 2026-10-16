@@ -114,9 +114,12 @@
     and dropped any that didn't pass — so everything below is green today, and turns
     red the day a change breaks your app.</p>
     <p class="explain"><strong>Use them anywhere, no QArena needed:</strong></p>
-    <pre class="code-block mono">pip install pytest playwright
+    <pre class="code-block mono">pip install pytest pytest-playwright playwright
 playwright install chromium
 pytest exported_tests/     # inside the downloaded evidence pack</pre>
+    <p class="micro"><code>pytest-playwright</code> is required — it provides the
+    <code>page</code> fixture and the <code>--base-url</code> flag these files use.
+    Without it pytest exits 4 and nothing runs.</p>
     <ul id="tests-list" class="tests-list mono"></ul>
   </div>
 

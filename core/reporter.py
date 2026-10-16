@@ -139,6 +139,14 @@ class Reporter:
                       "trace": f"trace_{pb.test_id}.zip",
                       "url": url, "test_id": pb.test_id,
                       "confidence": score,
+                      # raw console/network facts, so a reader can check the
+                      # finding without opening the trace. Bounded on purpose.
+                      "http_failures": [
+                          f"{f.get('method', '?')} {f.get('url', '?')} "
+                          f"→ {f.get('status', '?')}"
+                          for f in pb.evidence.http_failures[:10]],
+                      "console_errors": [str(c)[:200]
+                                         for c in pb.evidence.console_errors[:10]],
                       "signals": [f"S{h.signal} {h.name}: {h.evidence[:160]}"
                                   for h in signals]})
 
