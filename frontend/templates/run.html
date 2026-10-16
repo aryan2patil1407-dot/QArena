@@ -64,8 +64,22 @@
     <h3>🌫 Seen but unproven — dropped, never reported</h3>
     <p class="explain">We caught something odd, but it did not come back on at least
     2 of 3 clean-browser replays. Rather than waste your attention, we record it
-    here and move on.</p>
+    here and move on. Entries are labelled by <strong>why</strong> they were dropped:
+    <em>flaky</em> (the replay ran and the bug did not recur),
+    <em>inconclusive</em> (a replay step could not complete), or
+    <em>could not be re-tested</em> (the browser or target failed — that is a fact
+    about the test environment, never a claim that your app is fine).</p>
     <ul id="flaky-list"></ul>
+  </div>
+  <div class="tray" id="suppressed-tray" hidden>
+    <h3>🚫 Withheld — evidence came from a URL QArena guessed</h3>
+    <p class="explain">QArena probes a few common URLs (cart, checkout, search) to
+    map features that only exist after an interaction. If the site never links to
+    such a URL and never serves it, a failure there is <strong>QArena's guess being
+    wrong</strong>, not a defect in your app — so it is withheld here instead of
+    being filed. Genuine broken links (destinations your own pages link to) are
+    still reported normally.</p>
+    <ul id="suppressed-list"></ul>
   </div>
 </section>
 
@@ -107,6 +121,7 @@
   </div>
 
   <div class="cov-row mono" id="cov-row"></div>
+  <div class="micro" id="cov-basis" hidden></div>
 
   <div id="specimens" class="specimens"></div>
 

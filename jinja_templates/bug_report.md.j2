@@ -1,12 +1,18 @@
 # {{ bug.bug_id }} — {{ bug.title }}
 
-**Severity:** {{ bug.severity }}   **Status:** Confirmed (reproduced {{ bug.reproduced_count }} in clean-browser replay)
-**Journey:** `{{ bug.journey }}`   **Test:** `{{ bug.evidence.get('test_id', '—') }}`   **Route:** `{{ bug.route }}`   **Signals:** {{ bug.signals | map('string') | join(', ') }}
+**Severity:** {{ bug.severity }}   **Status:** Confirmed — reproduced {{ bug.reproduced_count }} in clean-browser replay
+**Journey:** `{{ bug.journey }}`   **Test:** `{{ bug.evidence.get('test_id', '—') }}`   **Page:** `{{ bug.route }}`   **Signals:** {{ bug.signals | map('string') | join(', ') }}
 {% if bug.evidence.get('url') -%}
 **URL at failure:** `{{ bug.evidence.get('url') }}`
 {% endif -%}
+{% if bug.evidence.get('affected_element') -%}
+**Control / element involved:** `{{ bug.evidence.get('affected_element') }}`
+{% endif -%}
 {% if bug.evidence.get('confidence') is not none -%}
-**Confidence:** {{ bug.evidence.get('confidence') }} (weighted signal score)
+**Confidence:** {{ bug.evidence.get('confidence') }}{% if bug.evidence.get('confidence_basis') %} — {{ bug.evidence.get('confidence_basis') }}{% endif %}
+{% endif -%}
+{% if bug.evidence.get('reproductions') -%}
+**Reproductions:** {{ bug.evidence.get('reproductions') }} (valid attempts)
 {% endif %}
 
 ## Steps to reproduce
@@ -16,15 +22,21 @@
 
 ## Expected behaviour
 {{ bug.expected_behavior }}
-
+{% if bug.evidence.get('expected_source') -%}
+*Where this expectation comes from:* {{ bug.evidence.get('expected_source') }}
+{% endif %}
 ## Actual behaviour
 {{ bug.actual_behavior }}
+
+## Why this is a problem
+{{ bug.evidence.get('why_it_matters', '') or '—' }}
 
 ## Console & network evidence
 {% set net = bug.evidence.get('http_failures') or [] -%}
 {% set con = bug.evidence.get('console_errors') or [] -%}
+{% set origin = bug.evidence.get('network_analysis') or [] -%}
 {% for f in net -%}
-- Network: {{ f }}
+- Network: {{ f }}{% for o in origin if o.url in f %} → {{ o.origin }}{% if o.note %} ({{ o.note }}){% endif %}{% endfor %}
 {% endfor -%}
 {% for c in con -%}
 - Console: {{ c }}

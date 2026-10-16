@@ -5,7 +5,7 @@
   const $ = (id) => document.getElementById(id);
   const state = {
     suspects: [], flaky: [], rejected: [], result: null,
-    steps: 0, done: false,
+    suppressed: 0, steps: 0, done: false,
   };
   const t0 = Date.now();
   const clockTimer = setInterval(() => {
@@ -133,9 +133,21 @@
         state.flaky.push(ev);
         $("st-flaky").textContent = state.flaky.length;
         $("flaky-tray").hidden = false;
-        renderTray("flaky-list", state.flaky,
-          (s) => `<b>${esc(humanSource(s.summary))}</b> — reappeared only ${esc(s.count)} of 3 tries`);
-        log(`✖ Dropped: ${humanSource(ev.journey)} — appeared only ${ev.count} of 3 replays, not solid enough to report`, "");
+        renderTray("flaky-list", state.flaky, flakyLine);
+        log(flakyLog(ev), "");
+        break;
+      case "suppressed":
+        state.suppressed = (state.suppressed || 0) + 1;
+        $("suppressed-tray").hidden = false;
+        renderTray("suppressed-list", state.suppressed > 1 ? [] : [ev],
+          (s) => `<b>${esc(humanSource(s.journey))}</b> — withheld: ${esc(s.reason)}`);
+        if (state.suppressed === 1) {
+          $("suppressed-list").innerHTML =
+            `<li><b>${esc(humanSource(ev.journey))}</b> — withheld: ${esc(ev.reason)}</li>`;
+        } else {
+          $("suppressed-list").insertAdjacentHTML("beforeend",
+            `<li><b>${esc(humanSource(ev.journey))}</b> — withheld: ${esc(ev.reason)}</li>`);
+        }
         break;
       case "step":
         state.steps += 1;
@@ -165,6 +177,33 @@
   function bump(id) { $(id).textContent = (+$(id).textContent || 0) + 1; }
   function renderTray(listId, items, tpl) {
     $(listId).innerHTML = items.map((i) => `<li>${tpl(i)}</li>`).join("");
+  }
+
+  // A dropped suspect is only "flaky" when the replay actually ran. An
+  // unreplayable suspect is a statement about the test environment, not about
+  // the app, and is labelled as such instead of being quietly blamed on
+  // "flakiness".
+  function flakyLine(s) {
+    const kind = s.kind || "flaky";
+    const label = `<b>${esc(humanSource(s.summary))}</b>`;
+    if (kind === "infrastructure_error")
+      return `${label} — <em>could not be re-tested</em>: ${esc(s.detail || "the replay never ran")}. This says nothing about your app.`;
+    if (kind === "inconclusive")
+      return `${label} — <em>inconclusive</em>: ${esc(s.detail || "a replay step could not complete")}. Not evidence of a defect either way.`;
+    if (kind === "not_reproduced")
+      return `${label} — <em>did not recur</em>: ${esc(s.detail || "clean replays did not reproduce it")}.`;
+    return `${label} — <em>flaky</em>: ${esc(s.detail || `reappeared in only ${s.reproduced || s.count}`)}. Below the 2-of-3 bar, so not reported.`;
+  }
+
+  function flakyLog(ev) {
+    const kind = ev.kind || "flaky";
+    if (kind === "infrastructure_error")
+      return `⚠ Not re-tested: ${humanSource(ev.journey)} — the replay could not run (${ev.detail || "infrastructure"}). No conclusion about the app.`;
+    if (kind === "inconclusive")
+      return `⚠ Inconclusive: ${humanSource(ev.journey)} — a replay step could not complete, so nothing is claimed.`;
+    if (kind === "not_reproduced")
+      return `— Dropped: ${humanSource(ev.journey)} — the clean replays did not reproduce it.`;
+    return `✖ Dropped: ${humanSource(ev.journey)} — reappeared only ${ev.count} of 3 replays, not solid enough to report`;
   }
 
   // ---------------------------------------------------------------- done
@@ -227,11 +266,27 @@
         ? `honest admission — planted bugs we did not find: ${b.missed.join(", ")}`
         : "no planted bug escaped — every one found and proven 🎉";
     }
-    if (res.coverage && res.coverage.routes_total) {
+    // withheld findings survive a restart: replayed runs show the same tray
+    if ((res.suppressed || []).length) {
+      $("suppressed-tray").hidden = false;
+      $("suppressed-list").innerHTML = res.suppressed
+        .map((s) => `<li><b>${esc(humanSource(s.journey))}</b> — withheld: ${esc(s.reason)}</li>`)
+        .join("");
+    }
+    if (res.coverage && (res.coverage.routes_total || res.coverage.journeys_planned)) {
+      const c = res.coverage;
+      const pct = (v) => (v === null || v === undefined) ? "n/a" : `${v}%`;
       $("cov-row").textContent =
-        `Coverage: ${res.coverage.route_coverage}% of pages tested (${res.coverage.routes_tested}/${res.coverage.routes_total}) · ` +
-        `${res.coverage.element_coverage}% of controls exercised (${res.coverage.elements_exercised}/${res.coverage.elements_total}) · ` +
-        `${(res.exported_tests || []).length} reusable regression tests exported`;
+        `Coverage — measured from browser execution, never from the plan: ` +
+        `${pct(c.route_coverage)} of live pages visited (${c.routes_executed ?? c.routes_tested}/${c.routes_total}) · ` +
+        `${pct(c.element_coverage)} of controls exercised (${c.elements_exercised}/${c.elements_total}) · ` +
+        `${c.journeys_planned || 0} journeys planned, ${c.journeys_executed || 0} executed` +
+        (c.journeys_unexecuted ? `, ${c.journeys_unexecuted} never ran` : "") +
+        (c.probe_only_routes && c.probe_only_routes.length
+          ? ` · ${c.probe_only_routes.length} guessed URL(s) excluded from testing (${c.probe_only_routes.join(", ")})` : "") +
+        ` · ${(res.exported_tests || []).length} reusable regression tests exported`;
+      $("cov-basis").textContent = c.measured_from || "";
+      $("cov-basis").hidden = !c.measured_from;
     }
     const bugs = res.filed_bugs || [];
     if (bugs.length) {
