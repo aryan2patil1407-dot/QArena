@@ -457,7 +457,10 @@ class Orchestrator:
         eligible = policy.eligible_routes()
         live = policy.live_routes()
         discovered = set(policy._by_route)
-        planned = {st.target for tc in cases for st in tc.steps
+        # compare like with like: a journey targets a concrete URL (/product/2)
+        # while execution is recorded per canonical route (/product/*), so both
+        # sides are canonicalised or a visited page looks unvisited
+        planned = {route_of_url(st.target) for tc in cases for st in tc.steps
                    if st.action == "goto"}
         executed_ok = {r for r in routes_executed if r in eligible}
 

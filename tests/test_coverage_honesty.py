@@ -121,3 +121,21 @@ def test_route_coverage_numerator_never_exceeds_its_denominator(ctx):
     assert cov["routes_live_count"] == 1, cov      # only / serves 200
     if cov["route_coverage"] is not None:
         assert 0 <= cov["route_coverage"] <= 100, cov
+
+
+def test_planned_concrete_urls_compare_against_canonical_execution(ctx):
+    """A journey to /product/2 covers /product/*: it is not "unexecuted"."""
+    home = make_state("S00", "/", 200,
+                      [StateElement(id="e1", role="link", name="Widget")],
+                      discovered_via="seed")
+    p1 = make_state("S01", "/product/*", 200,
+                    [StateElement(id="e2", role="button", name="Add to Cart")],
+                    discovered_via="link", link_name="Widget")
+    p1.url = "http://site.test/product/1"
+    appmap = make_map([home, p1],
+                      edges=[{"from": "S00", "to": "/product/*",
+                              "via": 'link "Widget"'}])
+    run = ctx.run(appmap=appmap, verdict="passed", suspects=[])
+    cov = run.results()["coverage"]
+    assert "/product/1" not in cov["routes_planned_not_executed"], cov
+    assert cov["routes_executed"] >= 1, cov
