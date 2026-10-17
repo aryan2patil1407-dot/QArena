@@ -95,6 +95,49 @@ class Planner:
                 return s.route.replace("/*", "/1")
         return default
 
+    # ---------------------------------------------------- feature discovery
+    def route_named(self, *words: str) -> str:
+        """A real route the target calls one of `words` — by URL or by its link.
+
+        Shops name the same page differently: /cart, /basket, /bag, /trolley.
+        Reading only the URL made QArena blind on any site that says "Basket"
+        (the target's own vocabulary is the evidence, not QArena's assumption).
+        The link label counts too, because the label is how the target presents
+        the feature to its users.
+        """
+        wanted = [self._norm(w) for w in words]
+        for s in self.map.states:
+            if not self.policy.exists(s.route):
+                continue
+            hay = self._norm(f"{s.route} {s.link_name or ''}")
+            if any(w in hay for w in wanted):
+                return s.route.replace("/*", "/1")
+        return ""
+
+    def basket_route(self) -> str:
+        """The page where a user reviews/updates what they are buying.
+
+        Two independent kinds of evidence, strongest first:
+          1. the route or its link label uses basket vocabulary;
+          2. the page carries a quantity control plus an update/remove control —
+             that structure IS a basket regardless of what it is called.
+        """
+        by_name = self.route_named("cart", "basket", "bag", "trolley")
+        if by_name:
+            return by_name
+        for s in self.map.states:
+            if not self.policy.exists(s.route):
+                continue
+            roles = {(e.role, self._norm(e.name)) for e in s.elements}
+            has_qty = any(r == "spinbutton" or "quantity" in n for r, n in roles)
+            has_update = any(
+                r == "button" and any(w in n for w in
+                                      ("update", "remove", "delete", "change"))
+                for r, n in roles)
+            if has_qty and has_update:
+                return s.route.replace("/*", "/1")
+        return ""
+
     def named(self, role: str, fragments) -> str:
         """First mapped element (original casing) whose name matches a fragment."""
         for s in self.map.states:
@@ -253,9 +296,13 @@ class Planner:
         # A feature journey may only navigate to a route the target itself
         # established (linked to it, or served it). A guessed /cart answering
         # 404 is not a broken cart: the site simply has no such route.
-        cart_route = self.feature_route("cart")
-        promo_route = self.feature_route("cart") if self.has("textbox", "promo") else ""
-        checkout_route = self.feature_route("checkout", "check-out", "pay")
+        # The feature is recognised by the target's OWN vocabulary: a shop that
+        # calls the page "Basket" (/basket) has a basket, even though the URL
+        # never says "cart".
+        cart_route = self.basket_route()
+        promo_route = cart_route if self.has("textbox", "promo") else ""
+        checkout_route = self.route_named("checkout", "check-out", "payment",
+                                          "pay") or self.feature_route("checkout")
 
         # --- search intent ---------------------------------------------------
         if self.has("searchbox", "") and prod:
@@ -284,33 +331,52 @@ class Planner:
                 steps=[StepSpec(step=1, action="goto", target="/"),
                        StepSpec(step=2, action="dblclick", role="button", name="Add to Cart")],
                 expected=ExpectedContract(badge_equals=1)))
-        if can_cart and cart_route and self.has("spinbutton", "quantity") \
-                and self.has("button", "update"):
+        # The quantity control must exist ON the basket page — that control is
+        # the evidence the feature exists. "Add to Cart" is only used to seed the
+        # basket when the app actually has such a button; a shop that lists items
+        # without one still deserves the quantity test.
+        qty_on_basket = cart_route and self._on_route(cart_route, "spinbutton",
+                                                      "Quantity")
+        update_on_basket = cart_route and self._on_route(cart_route, "button",
+                                                         "Update")
+        if qty_on_basket and update_on_basket:
+            seed = ([StepSpec(step=1, action="goto", target="/"),
+                     StepSpec(step=2, action="click", role="button",
+                              name="Add to Cart")]
+                    if can_cart else [])
+            neg_steps = [*seed,
+                         StepSpec(step=len(seed) + 1, action="goto", target=cart_route),
+                         StepSpec(step=len(seed) + 2, action="fill", role="spinbutton",
+                                  name="Quantity", value="-5"),
+                         StepSpec(step=len(seed) + 3, action="click", role="button",
+                                  name="Update")]
+            for i, st in enumerate(neg_steps, 1):
+                st.step = i
             T.append(TestCase(
                 test_id=nid(), journey_type="edge_case_negative",
                 title="Cart rejects negative quantity (-5)",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target=cart_route),
-                       StepSpec(step=4, action="fill", role="spinbutton", name="Quantity", value="-5"),
-                       StepSpec(step=5, action="click", role="button", name="Update")],
+                steps=neg_steps,
+                # NO invented wording: we assert only that invalid input is
+                # refused and that money never goes negative. Requiring a
+                # specific message ("between 1 and 10") would fail a shop that
+                # phrases its validation differently.
                 expected=ExpectedContract(should_reject=True,
-                                          error_text="between 1 and 10",
                                           money_non_negative=True)))
             if checkout_route and self.has("button", "pay"):
                 T.append(TestCase(
                     test_id=nid(), journey_type="adversarial",
                     title="Negative quantity must never produce a negative money total",
-                    steps=[StepSpec(step=1, action="goto", target="/"),
-                           StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                           StepSpec(step=3, action="goto", target=cart_route),
-                           StepSpec(step=4, action="fill", role="spinbutton", name="Quantity", value="-5"),
-                           StepSpec(step=5, action="click", role="button", name="Update"),
-                           StepSpec(step=6, action="goto", target=checkout_route),
-                           StepSpec(step=7, action="fill", role="textbox", name="Full name", value="Neg Tester"),
-                           StepSpec(step=8, action="fill", role="textbox", name="Email", value="neg@qarena.dev"),
-                           StepSpec(step=9, action="fill", role="textbox", name="Street address", value="1 Bug Lane"),
-                           StepSpec(step=10, action="click", role="button", name="Pay Now")],
+                    steps=[*neg_steps,
+                           StepSpec(step=len(neg_steps) + 1, action="goto",
+                                    target=checkout_route),
+                           StepSpec(step=len(neg_steps) + 2, action="fill", role="textbox",
+                                    name="Full name", value="Neg Tester"),
+                           StepSpec(step=len(neg_steps) + 3, action="fill", role="textbox",
+                                    name="Email", value="neg@qarena.dev"),
+                           StepSpec(step=len(neg_steps) + 4, action="fill", role="textbox",
+                                    name="Street address", value="1 Bug Lane"),
+                           StepSpec(step=len(neg_steps) + 5, action="click",
+                                    role="button", name="Pay Now")],
                     # NOT should_reject: on a correct app the -5 is rejected at
                     # Update and the remaining positive cart may legitimately be
                     # paid. The true invariant: money must never go negative.
@@ -322,36 +388,47 @@ class Planner:
         # Testing a single representative page hides exactly the defects a user
         # would hit, so every observed page gets its own check.
         for i, purl in enumerate(self._concrete_urls("product", limit=3)):
-            title = ("Product page: Add to Cart with a clean console" if i == 0
-                     else f"Product page {purl}: Add to Cart with a clean console")
+            # Does THIS page carry an add-to-cart button? A catalog page that
+            # only links onward has no button, and demanding one would reject a
+            # perfectly useful page-load check (that is how a page-throwing
+            # script went unseen on a shop without "Add to Cart").
+            has_cta = self._on_route(purl, "button", "Add to Cart")
+            label = ("Product page" if i == 0 else f"Product page {purl}")
+            steps = [StepSpec(step=1, action="goto", target=purl)]
+            if has_cta:
+                steps.append(StepSpec(step=2, action="click", role="button",
+                                      name="Add to Cart"))
+                label += ": Add to Cart with a clean console"
+            else:
+                label += ": loads with a clean console"
             T.append(TestCase(
-                test_id=nid(), journey_type="happy_path", title=title,
-                steps=[StepSpec(step=1, action="goto", target=purl),
-                       StepSpec(step=2, action="click", role="button",
-                                name="Add to Cart")],
-                expected=ExpectedContract(badge_equals=None)))
+                test_id=nid(), journey_type="happy_path", title=label,
+                steps=steps, expected=ExpectedContract(badge_equals=None)))
 
         if promo_route and self.has("textbox", "promo") \
                 and self.has("button", "apply"):
-            T.append(TestCase(
-                test_id=nid(), journey_type="happy_path",
-                title="Promo SAVE10 applies a 10% discount",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target=promo_route),
-                       StepSpec(step=4, action="fill", role="textbox", name="Promo code", value="SAVE10"),
-                       StepSpec(step=5, action="click", role="button", name="Apply")],
-                expected=ExpectedContract(text_required=["Promo"], no_new_errors_5xx=True)))
+            # Only the graceful-rejection journey is grounded: QArena cannot
+            # know which promo codes the shop actually honours, so "SAVE10
+            # applies 10%" was an invented requirement (and filing its failure
+            # blamed the target for QArena's guess). An unknown code must be
+            # refused politely — that every shop owes its users.
+            seed = ([StepSpec(step=1, action="goto", target="/"),
+                     StepSpec(step=2, action="click", role="button",
+                              name="Add to Cart")]
+                    if self.has("button", "add to cart")
+                    else [StepSpec(step=1, action="goto", target="/")])
+            steps = [*seed,
+                     StepSpec(step=0, action="goto", target=promo_route),
+                     StepSpec(step=0, action="fill", role="textbox",
+                              name="Promo code", value="XXX-NOPE"),
+                     StepSpec(step=0, action="click", role="button", name="Apply")]
+            for i, st in enumerate(steps, 1):
+                st.step = i
             T.append(TestCase(
                 test_id=nid(), journey_type="edge_case_negative",
                 title="Unknown promo code fails gracefully",
-                steps=[StepSpec(step=1, action="goto", target="/"),
-                       StepSpec(step=2, action="click", role="button", name="Add to Cart"),
-                       StepSpec(step=3, action="goto", target=promo_route),
-                       StepSpec(step=4, action="fill", role="textbox", name="Promo code", value="XXX-NOPE"),
-                       StepSpec(step=5, action="click", role="button", name="Apply")],
-                expected=ExpectedContract(should_reject=True,
-                                          error_text="Invalid promo code")))
+                steps=steps,
+                expected=ExpectedContract(should_reject=True)))
 
         # --- checkout ---------------------------------------------------------
         # every step here is conditional on the target ACTUALLY having that

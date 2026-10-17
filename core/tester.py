@@ -16,7 +16,10 @@ from . import config
 from .contracts import AppMap, ExpectedContract, StepEvidence, StepSpec, TestCase
 from .sandbox import Sandbox
 
-NEG_MONEY_RE = re.compile(r"[-−–]\s?\$\s?\d|\$\s?[-−–]\s?\d")
+# the whole amount, not just its first digit: a report that says '-$6' for a
+# '-$64.95' total sends the reader looking for the wrong number
+NEG_MONEY_RE = re.compile(
+    r"[-−–]\s?\$\s?\d[\d,]*(?:\.\d{2})?|\$\s?[-−–]\s?\d[\d,]*(?:\.\d{2})?")
 PRICE_OF_RE = re.compile(r"([A-Z][A-Za-z0-9&'’\- ]{2,40}?)[^\n$]{0,40}\$(\d{1,5})\.(\d{2})")
 
 
@@ -303,7 +306,10 @@ class Tester:
             return out
         if NEG_MONEY_RE.search(text):
             m = NEG_MONEY_RE.search(text)
-            out.append(f"Negative money amount visible: '{m.group(0)}' — money can never be negative per the app description")
+            # no appeal to a "description" that was never parsed: this is a
+            # universal invariant of pricing, stated as such
+            out.append(f"Negative money amount visible: '{m.group(0)}' — "
+                       f"a price or total must never be negative")
         if "$0.00" in text and re.search(r"no items|order confirmed", text, re.I) \
                 and "confirmed" in text.lower():
             out.append("$0.00 order confirmed with no items — contradicts checkout description")
