@@ -1,0 +1,24 @@
+# QArena - Autonomous AI QA Engineer
+
+QArena explores web applications with Playwright, checks behaviour against plain-language rules, verifies suspected bugs by replay, and exports reusable tests.
+
+## Run locally
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+playwright install chromium
+Copy-Item .env.example .env
+uvicorn app.main:app --reload --port 8088
+```
+
+Open http://localhost:8088. QArena works without an LLM key in deterministic heuristic mode.
+
+## Team workspace
+
+Create a project, add teammates with frontend, backend, QA, DevOps, or project-lead roles, and select the project when starting an expedition. Completed runs provide full and role-focused reports, downloadable markdown reports, and shareable links. Project metadata is stored in QA_ARTIFACTS_DIR.
+
+## Deployment
+
+See DEPLOYMENT.md. Production expeditions use a Redis-backed RQ queue, a separate Playwright/Chromium worker, and S3-compatible evidence storage. Local development defaults to an in-process worker.
