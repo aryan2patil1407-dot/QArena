@@ -20,6 +20,23 @@ try:
 except ImportError:
     pass
 
+# LiteLLM 1.104.0–1.105.1 resolve rust_bridge imports lazily from their logging
+# filter (attached to uvicorn.access when litellm is imported), so the first
+# `import litellm` must not run on a worker thread: QArena starts each run in
+# one, and any log record from another thread during that window observes
+# rust_bridge.catalog half-initialized (ImportError: cannot import name
+# 'RouteContext' from partially initialized module ...; upstream #46142).
+# Import once here, on the thread that imports QArena, before a run thread
+# starts. A failed warm-up simply keeps heuristic mode.
+try:
+    import litellm  # noqa: F401
+    import litellm.utils  # noqa: F401
+    import litellm.rust_bridge.catalog  # noqa: F401
+    import litellm.rust_bridge.configuration  # noqa: F401
+    import litellm.types.secret_managers.main  # noqa: F401
+except Exception:  # optional dependency: a broken install must not kill startup
+    pass
+
 KEY_ENV_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY",
                  "ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY")
 
